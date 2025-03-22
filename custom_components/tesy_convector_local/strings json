@@ -1,0 +1,12 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "error": {
+          "already_configured": "This device is already configured.",
+          "cannot_connect": "Cannot connect to the provided IP address."
+        }
+      }
+    }
+  }
+}

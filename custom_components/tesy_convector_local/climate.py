@@ -8,7 +8,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from datetime import timedelta
 
 from .tesy_convector import TesyConvector
-
+from .const import DOMAIN 
 import logging
 
 _LOGGER = logging.getLogger(__name__)
