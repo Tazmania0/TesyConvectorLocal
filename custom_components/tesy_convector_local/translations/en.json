@@ -24,8 +24,8 @@
         "description": "Set up window detection and temperature correction.",
         "data": {
           "temperature_correction": "Temperature correction",
-          "window_open_enabled": "Enable open window detection",
           "use_internal_temp": "Use external temperature sensor",
+          "window_open_enabled": "Enable open window detection",
           "temp_fall_rate": "Window open detection rate",
           "temp_recovery_rate": "Window close detection rate",
           "temp_recovery_abs": "Window close recovery threshold",

@@ -7,8 +7,13 @@ This custom integration allows you to control your Tesy Convector directly from 
 - HVAC Modes: Switch between Auto, Heat, and Off modes.
 - Target Temperature Adjustment: Easily set your desired temperature.
 - Supports External Temperature Sensors: Integrate a separate Home Assistant sensor to track temperature.
+- Support for convector temperature correction
 - Local API Communication: Utilizes the local API, ensuring fast and secure control without relying on cloud services.
 - add "set_opened_window" service to set opened window status
+- Smart window open detection:
+    * Based on temperature drop rate & recovery
+    * Customizable hysteresis delay to avoid toggling
+    * Binary_sensor for window open status
 
 ## Tested with:
 - Tesy Convector CN06AS
@@ -29,5 +34,6 @@ This custom integration allows you to control your Tesy Convector directly from 
 ### set_opened_window service usage
     service: tesy_convector_local.set_opened_window
     data:
-      entity_id: climate.tesy_convector
-      status: "on"  # or "off"
+      entity_id: climate.tesy_convector_cn06as
+      status: "on"
+

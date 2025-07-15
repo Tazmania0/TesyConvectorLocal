@@ -1,88 +1,168 @@
+"""Tesy Convector device API wrapper.
+
+Provides async methods for communicating with Tesy Convector devices over HTTP, including status, mode, temperature, and advanced features.
+"""
+
 import aiohttp
-import async_timeout
+import asyncio
 import logging
+import json
+# from .const import CONF_TEMPERATURE_CORRECTION
 
 _LOGGER = logging.getLogger(__name__)
 
+
 class TesyConvector:
-    def __init__(self, ip_address, model):
+    """Client for Tesy Convector device HTTP API."""
+
+    def __init__(self, ip_address, model) -> None:
+        """Initialize Tesy Convector client.
+
+        Args:
+            ip_address (str): Device IP address.
+            model (str): Device model name.
+        """
         self.base_url = f"http://{ip_address}"
         self.model = model
         self.ip_address = ip_address  # Add ip_address as an attribute
+        self._unavailable_logged = False
+        self._json_error_logged = False
 
     async def send_command(self, endpoint, payload):
+        """Send a command to the device and return the response.
+
+        Args:
+            endpoint (str): API endpoint name.
+            payload (dict): JSON payload for the request.
+        Returns:
+            dict: Parsed JSON response or error dict.
+        """
         url = f"{self.base_url}/{endpoint}"
 
         async with aiohttp.ClientSession() as session:
             try:
-                async with async_timeout.timeout(10):
+                async with asyncio.timeout(10):
                     async with session.post(url, json=payload) as response:
                         try:
-                            # Try to parse the response as JSON even if the Content-Type is incorrect
-                            return await response.json(content_type=None)
-                        except aiohttp.ContentTypeError:
-                            # If parsing fails, log the plain text response
+                            result = await response.json(content_type=None)
+                            # Reset error flags on any successful JSON response
+                            if self._unavailable_logged or self._json_error_logged:
+                                self._unavailable_logged = False
+                                self._json_error_logged = False
+                            return result
+                        except (aiohttp.ContentTypeError, json.JSONDecodeError):
                             text_response = await response.text()
-                            _LOGGER.error("Unexpected response format: %s", text_response)
-                            return {"error": f"Unexpected response: {text_response}"}
+                            if not self._json_error_logged:
+                                _LOGGER.error(
+                                    "Invalid JSON from Tesy Convector: %s",
+                                    text_response,
+                                )
+                                self._json_error_logged = True
+                            return {"error": f"Invalid JSON: {text_response}"}
+                        else:
+                            return result
             except aiohttp.ClientError as e:
-                _LOGGER.error("HTTP error communicating with Tesy Convector: %s", e)
+                if not self._unavailable_logged:
+                    _LOGGER.error("HTTP error communicating with Tesy Convector: %s", e)
+                    self._unavailable_logged = True
                 return {"error": str(e)}
-            except Exception as e:
-                _LOGGER.error("Error communicating with Tesy Convector: %s", e)
+            except TimeoutError as e:
+                if not self._unavailable_logged:
+                    _LOGGER.error("Timeout communicating with Tesy Convector: %s", e)
+                    self._unavailable_logged = True
                 return {"error": str(e)}
 
     def get_status(self):
+        """Request current device status."""
         return self.send_command("getStatus", {})
 
     def turn_on(self):
+        """Turn the device on."""
         return self.send_command("onOff", {"status": "on"})
 
     def turn_off(self):
+        """Turn the device off."""
         return self.send_command("onOff", {"status": "off"})
 
     def set_mode(self, mode):
-        # Mode could be: off, eco, comfort, etc.
+        """Set the device mode (e.g., off, eco, comfort).
+
+        Mode could be: off, eco, comfort, etc.
+        """
         return self.send_command("setMode", {"name": mode})
 
     def set_temperature(self, temp):
+        """Set the target temperature."""
         return self.send_command("setTemp", {"temp": temp})
 
     def set_adaptive_start(self, status):
-        # Status: on or off
+        """Enable or disable adaptive start.
+
+        Status: on or off
+        """
+
         return self.send_command("setAdaptiveStart", {"status": status})
 
     def set_opened_window(self, status):
-        # Status: on or off
+        """Enable or disable window open detection.
+
+        Status: on or off
+        """
         return self.send_command("setOpenedWindow", {"status": status})
 
     def set_delayed_start(self, time, temp):
-        # Time in minutes and temperature
-        return self.send_command("setDelayedStart", {"status": "on", "time": time, "temp": temp})
+        """Set delayed start with time and temperature.
+
+        Time in minutes and temperature
+        """
+        return self.send_command(
+            "setDelayedStart", {"status": "on", "time": time, "temp": temp}
+        )
 
     def set_temperature_correction(self, temp):
-        # Temperature correction
+        """Set the temperature correction value.
+
+        Use CONF_TEMPERATURE_CORRECTION for key if storing or referencing
+
+        Example: self.data[CONF_TEMPERATURE_CORRECTION] = temp
+        """
         return self.send_command("setTCorrection", {"temp": temp})
 
     def set_anti_frost(self, status):
-        # Status: on or off
+        """Enable or disable anti-frost mode.
+
+        Status: on or off
+        """
         return self.send_command("setAntiFrost", {"status": status})
 
     def set_comfort_temperature(self, temp):
+        """Set comfort mode temperature."""
         return self.send_command("setComfortTemp", {"temp": temp})
 
     def set_eco_temperature(self, temp, time):
-        # Time in minutes
+        """Set eco mode temperature and duration.
+
+        Time in minutes
+        """
         return self.send_command("setEcoTemp", {"temp": temp, "time": time})
 
     def set_sleep_temperature(self, temp, time):
-        # Time in minutes
+        """Set sleep mode temperature and duration.
+
+        Time in minutes
+        """
         return self.send_command("setSleepTemp", {"temp": temp, "time": time})
 
     def set_uv(self, status):
-        # Status: on or off
+        """Enable or disable UV function.
+
+        Status: on or off
+        """
         return self.send_command("setUV", {"status": status})
 
     def lock_device(self, status):
-        # Status: on or off
+        """Lock or unlock the device.
+
+        Status: on or off
+        """
         return self.send_command("setLockDevice", {"status": status})

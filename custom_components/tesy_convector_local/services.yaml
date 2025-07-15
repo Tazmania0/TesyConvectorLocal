@@ -1,0 +1,31 @@
+set_opened_window:
+  name: Set Opened Window Status
+  description: >
+    Manually override the window open detection for the Tesy Convector.
+
+    Use this to force the convector into an energy-saving state (as if a window was opened),
+    or restore normal heating when the window is closed again. This is especially useful for
+    debugging or manual override in automations.
+
+  fields:
+    entity_id:
+      name: Climate Entity
+      description: The `climate.` entity ID of the Tesy Convector.
+      required: true
+      selector:
+        entity:
+          domain: climate
+
+    status:
+      name: Window Status
+      description: >
+        The window open status to set. Use `"on"` to simulate an open window
+        (heating stops), or `"off"` to resume heating.
+      required: true
+      example: "on"
+      selector:
+        select:
+          options:
+            - "on"
+            - "off"
+

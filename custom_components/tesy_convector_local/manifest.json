@@ -2,13 +2,15 @@
   "domain": "tesy_convector_local",
   "name": "Tesy Convector Integration",
   "version": "1.0.0",
-  "documentation": "https://github.com/moniNaydenov/TesyConvectorLocal",
+  "documentation": "https://github.com/Tazmania0/TesyConvectorLocal",
   "dependencies": [],
   "requirements": ["requests"],
-  "codeowners": ["@alexanderpp"],
+  "codeowners": ["@tazmania0"],
   "config_flow": true,
   "integration_type": "device",
   "iot_class": "local_polling",
+  "supported_platforms": ["climate", "number", "binary_sensor"],
   "icon": "custom_components/tesy_convector_local/icon.png",
   "logo": "custom_components/tesy_convector_local/icon.png"
 }
+
