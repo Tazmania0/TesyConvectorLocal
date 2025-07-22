@@ -33,6 +33,7 @@ from .const import (
     DEFAULT_TEMP_RECOVERY_RATE,
     DOMAIN,
     WINDOW_RECOVERY_HYSTERESIS_SEC,
+    WINDOW_OPEN_TIMEOUT_SEC,
 )
 from .tesy_convector import TesyConvector
 
@@ -378,9 +379,13 @@ class TesyConvectorClimate(ClimateEntity):
                         else 0
                     )
 
-                    if time_since_change > WINDOW_RECOVERY_HYSTERESIS_SEC and (
-                        trend > temp_recovery_rate or dtemp > temp_recovery_abs
-                    ):
+                    if (time_since_change > WINDOW_RECOVERY_HYSTERESIS_SEC\
+                        and (trend > temp_recovery_rate or dtemp > temp_recovery_abs))\
+                        or (now - self._window_change_time) > WINDOW_OPEN_TIMEOUT_SEC:
+
+                        if (now - self._window_change_time) > WINDOW_OPEN_TIMEOUT_SEC:
+                            _LOGGER.warning("Window open timeout exceeded, restoring HVAC mode.")
+
                         self._window_opened = False
                         await self.convector.set_opened_window("off")
                         if (
