@@ -1,7 +1,7 @@
 {
   "domain": "tesy_convector_local",
   "name": "Tesy Convector Integration",
-  "version": "1.0.0",
+  "version": "0.3.0",
   "documentation": "https://github.com/Tazmania0/TesyConvectorLocal",
   "dependencies": [],
   "requirements": ["requests"],
@@ -13,4 +13,3 @@
   "icon": "custom_components/tesy_convector_local/icon.png",
   "logo": "custom_components/tesy_convector_local/icon.png"
 }
-
