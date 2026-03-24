@@ -15,7 +15,7 @@ _LOGGER = logging.getLogger(__name__)
 class TesyConvector:
     """Client for Tesy Convector device HTTP API."""
 
-    def __init__(self, ip_address, model) -> None:
+    def __init__(self, ip_address, model, session: aiohttp.ClientSession) -> None:
         """Initialize Tesy Convector client.
 
         Args:
@@ -24,29 +24,38 @@ class TesyConvector:
         """
         self.base_url = f"http://{ip_address}"
         self.model = model
-        self.ip_address = ip_address  # Add ip_address as an attribute
+        self.ip_address = ip_address
+        self._session = session
         self._unavailable_logged = False
         self._json_error_logged = False
 
     async def send_command(self, endpoint, payload):
         """Send a command to the device and return the response.
 
+        On transient network errors (connection reset, timeout) returns an
+        error dict immediately — no inline sleep/retry here.  The caller
+        (async_update in climate.py) tracks the failure time and skips polls
+        for 30 seconds before trying again, keeping trying indefinitely until
+        the device responds.
+
+        Invalid JSON is returned as-is — not a transient issue.
+
         Args:
             endpoint (str): API endpoint name.
             payload (dict): JSON payload for the request.
         Returns:
-            dict: Parsed JSON response or error dict.
+            dict: Parsed JSON response or {"error": ...} on failure.
         """
         url = f"{self.base_url}/{endpoint}"
 
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with asyncio.timeout(10):
-                    async with session.post(url, json=payload) as response:
+        try:
+            async with asyncio.timeout(10):
+                async with self._session.post(url, json=payload) as response:
                         try:
                             result = await response.json(content_type=None)
-                            # Reset error flags on any successful JSON response
+                            # Successful response — clear error flags
                             if self._unavailable_logged or self._json_error_logged:
+                                _LOGGER.info("Tesy Convector communication restored")
                                 self._unavailable_logged = False
                                 self._json_error_logged = False
                             return result
@@ -59,18 +68,12 @@ class TesyConvector:
                                 )
                                 self._json_error_logged = True
                             return {"error": f"Invalid JSON: {text_response}"}
-                        else:
-                            return result
-            except aiohttp.ClientError as e:
-                if not self._unavailable_logged:
-                    _LOGGER.error("HTTP error communicating with Tesy Convector: %s", e)
-                    self._unavailable_logged = True
-                return {"error": str(e)}
-            except TimeoutError as e:
-                if not self._unavailable_logged:
-                    _LOGGER.error("Timeout communicating with Tesy Convector: %s", e)
-                    self._unavailable_logged = True
-                return {"error": str(e)}
+
+        except (aiohttp.ClientError, TimeoutError) as e:
+            if not self._unavailable_logged:
+                _LOGGER.warning("Tesy Convector unreachable: %s", e)
+                self._unavailable_logged = True
+            return {"error": str(e)}
 
     def get_status(self):
         """Request current device status."""
