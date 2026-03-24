@@ -5,6 +5,7 @@ Defines the temperature correction number entity for Tesy Convector devices.
 
 from homeassistant.components.number import NumberEntity
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import DeviceInfo
 
 from .const import CONF_MODEL, CONF_TEMPERATURE_CORRECTION, DOMAIN
 
@@ -24,24 +25,16 @@ class TesyTemperatureCorrectionNumber(NumberEntity):
         self._device = device
         self._config_entry = config_entry
 
-        # Generate model-based entity ID (e.g., number.ht_2000_temperature_correction)
-        model = getattr(device, CONF_MODEL, None)
-        if model:
-            model = model.replace(" ", "_").lower()
-        else:
-            model = "unknown"
-        self._attr_entity_id = f"number.{model}_{CONF_TEMPERATURE_CORRECTION}"
-        # self._attr_entity_id = f"number.{CONF_TEMPERATURE_CORRECTION}"
-
-        # Maintain unique ID for entity registry
+        # FIX: Do not set _attr_entity_id manually — HA entity registry manages
+        # entity IDs via unique_id. Manual assignment bypasses rename/migration.
         self._attr_unique_id = f"{config_entry.entry_id}_temp_correction"
 
-        # Device association
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, config_entry.entry_id)},
-            "model": getattr(device, CONF_MODEL, "Unknown"),
-            "manufacturer": "Tesy",
-        }
+        # FIX: Use DeviceInfo object, not a plain dict — required by newer HA versions.
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, config_entry.entry_id)},
+            model=getattr(device, CONF_MODEL, "Unknown"),
+            manufacturer="Tesy",
+        )
 
         self._attr_native_min_value = -4
         self._attr_native_max_value = 4
