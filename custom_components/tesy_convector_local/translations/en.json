@@ -4,11 +4,16 @@
     "step": {
       "user": {
         "title": "Tesy Convector setup",
-        "description": "Configure your Tesy Convector device for local control.",
+        "description": "Configure your Tesy Convector device. The temperature correction offset is applied by the device firmware in all modes — set it here so it takes effect immediately even without an external sensor.",
         "data": {
           "ip_address": "Device IP address",
           "model": "Device model",
-          "temperature_entity": "External temperature sensor (optional)"
+          "temperature_correction": "Temperature correction offset (°C)"
+        },
+        "data_description": {
+          "ip_address": "Local IP address of the convector on your network.",
+          "temperature_correction": "Integer offset −4…+4 applied by the device firmware. Use a reference thermometer to calibrate — positive values raise the reported temperature.",
+          "model": "Select your convector model from the list."
         },
         "error": {
           "already_configured": "This device is already configured.",
@@ -20,16 +25,39 @@
   "options": {
     "step": {
       "init": {
-        "title": "Tesy convector options",
-        "description": "Set up window detection and temperature correction.",
+        "title": "Tesy Convector options",
+        "description": "Temperature correction is always active. Enable **Use external temperature sensor** to unlock window detection and software on/off control with half-degree setpoints.",
         "data": {
-          "temperature_correction": "Temperature correction",
-          "use_internal_temp": "Use external temperature sensor",
+          "temperature_correction": "Temperature correction offset (°C)",
+          "use_external_temp": "Use external temperature sensor",
+          "temperature_entity": "External temperature sensor entity",
           "window_open_enabled": "Enable open window detection",
-          "temp_fall_rate": "Window open detection rate",
-          "temp_recovery_rate": "Window close detection rate",
-          "temp_recovery_abs": "Window close recovery threshold",
-          "temperature_entity": "External temperature sensor"
+          "temp_fall_rate": "Window open — temperature drop rate (°C/min)",
+          "temp_recovery_rate": "Window close — temperature recovery rate (°C/min)",
+          "temp_recovery_abs": "Window close — minimum temperature rise (°C)",
+          "sw_control_enabled": "Enable software on/off control",
+          "sw_min_on_sec": "Minimum ON phase duration (s)",
+          "sw_min_off_sec": "Minimum OFF phase duration (s)",
+          "sw_hysteresis": "Dead-band width (°C)",
+          "sw_lag_time": "Thermal lag — minutes temperature keeps rising after heater stops",
+          "sw_i_gain": "Drift correction strength (0 = off, 0.5 = recommended, 1.0 = full)",
+          "sw_ema_alpha": "Sensor noise filtering (0.1 = smooth, 0.3 = recommended, 1.0 = off)"
+        },
+        "data_description": {
+          "temperature_correction": "Integer offset −4…+4 applied by the device firmware in all control modes.",
+          "use_external_temp": "Required for window detection and software control. The external sensor must be in the same room, away from the convector.",
+          "temperature_entity": "A Home Assistant sensor entity that reports the room temperature in °C.",
+          "window_open_enabled": "Detects a rapid temperature drop and turns the convector off automatically to save energy.",
+          "temp_fall_rate": "How fast the temperature must drop (°C per minute) to trigger window-open detection. Lower = more sensitive. Typical: 0.5°C/min.",
+          "temp_recovery_rate": "How fast the temperature must rise (°C per minute) to confirm the window has closed. Typical: 0.2°C/min.",
+          "temp_recovery_abs": "Minimum total temperature rise (°C) required before the window is considered closed. Prevents false recovery on small fluctuations.",
+          "sw_control_enabled": "HA controls the relay directly, enabling half-degree setpoints and protecting relay contacts with minimum ON/OFF phase guards. Requires an external sensor.",
+          "sw_min_on_sec": "The heater stays on for at least this many seconds after each ON command, protecting relay contacts from rapid switching. Typical: 60s.",
+          "sw_min_off_sec": "The heater stays off for at least this many seconds after each OFF command. Typical: 60s.",
+          "sw_hysteresis": "The dead-band around the setpoint. Heater turns OFF at setpoint, turns ON again only after the temperature drops by this amount below setpoint. Wider = fewer relay cycles but more temperature swing. Typical: 0.3°C.",
+          "sw_lag_time": "Time (minutes) between the heater turning off and the temperature sensor reaching its peak. The controller turns off early to compensate for this delay and avoid overshoot. Measure by watching how long the temperature keeps rising after the heater stops. Typical: 2–8 min.",
+          "sw_i_gain": "Corrects long-term average temperature drift above the setpoint. 0 = disabled. 0.5 = recommended starting point (halves the measured drift). 1.0 = full correction. Increase if the room consistently runs above setpoint over 30+ minutes.",
+          "sw_ema_alpha": "Low-pass filter applied to the external sensor to remove noise. 0.1 = heavy smoothing (slow to respond, very stable). 0.3 = recommended (30s time constant at 10s poll). 1.0 = no filtering (raw sensor). Reduce if the sensor is noisy."
         }
       }
     }
