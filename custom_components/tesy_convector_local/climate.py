@@ -221,6 +221,26 @@ class TesyConvectorClimate(ClimateEntity):
     def _get_options(self) -> dict:
         return self._config_entry.options if self._config_entry else {}
 
+    async def _apply_stored_temperature_correction(self) -> None:
+        """Apply configured temperature correction to the device, if any."""
+        correction = self._get_options().get(
+            CONF_TEMPERATURE_CORRECTION,
+            self._config_entry.data.get(CONF_TEMPERATURE_CORRECTION) if self._config_entry else None,
+        )
+        if correction is None:
+            return
+        try:
+            await self.convector.set_temperature_correction(int(correction))
+            _LOGGER.debug(
+                "Applied stored temperature correction %s°C after reconnect",
+                correction,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "Failed to re-apply temperature correction after reconnect: %s",
+                exc,
+            )
+
     def _persist_setpoint(self, temp: float) -> None:
         """Save the Heat setpoint to options so it survives reboots."""
         self.hass.config_entries.async_update_entry(
@@ -348,6 +368,7 @@ class TesyConvectorClimate(ClimateEntity):
             if not self._attr_available:
                 _LOGGER.info("Tesy Convector is back online — restoring availability")
                 self._attr_available = True
+                await self._apply_stored_temperature_correction()
                 self.async_write_ha_state()
 
             # When sw-control is active the device is frequently turned off
