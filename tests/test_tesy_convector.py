@@ -230,3 +230,24 @@ def test_poll_and_control_requests_do_not_overlap_and_cancel_releases_lock():
         assert calls == ['getStatus', 'onOff']
 
     asyncio.run(scenario())
+
+
+def test_requests_allow_firmware_to_settle_between_connections(monkeypatch):
+    clock = [100.0]
+    gaps = []
+    monkeypatch.setattr(module, 'monotonic', lambda: clock[0])
+
+    async def pause(seconds):
+        gaps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(module.asyncio, 'sleep', pause)
+    client = TesyConvector('192.0.2.1', 'CN06AS', _MockSession(response=_MockResponse(json_value={})))
+
+    async def scenario():
+        await client.get_status()
+        await client.set_temperature(22)
+        await client.set_mode('heating')
+
+    asyncio.run(scenario())
+    assert gaps == [0.5, 0.5]

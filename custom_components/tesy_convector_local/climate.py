@@ -12,6 +12,7 @@ from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import ClimateEntityFeature, HVACAction, HVACMode
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.event import async_track_time_interval
@@ -56,7 +57,7 @@ from .tesy_convector import TesyConvector
 _LOGGER = logging.getLogger(__name__)
 
 
-class DeviceCommandError(RuntimeError):
+class DeviceCommandError(HomeAssistantError):
     """A failed device write that must remain retryable during polling."""
 
 SET_OPENED_WINDOW_SCHEMA = vol.Schema(
@@ -245,6 +246,13 @@ class TesyConvectorClimate(ClimateEntity):
         self._comm_failures = 0
         self._control_error_logged = False
         self._pending_boot_mode = None
+        self._startup_sensor_deadline = None
+        self._startup_target_applied = False
+        self._firmware_heating_mode = None
+        self._update_lock = asyncio.Lock()
+        self._boot_state_unreconciled = False
+        self._startup_read_only = False
+        self._startup_correction_pending = False
 
         # Entity availability — False while device is unreachable.
         # HA blocks commands and automations when unavailable.
@@ -264,25 +272,33 @@ class TesyConvectorClimate(ClimateEntity):
     def _get_options(self) -> dict:
         return self._config_entry.options if self._config_entry else {}
 
-    async def _apply_stored_temperature_correction(self) -> None:
+    async def _apply_stored_temperature_correction(self) -> bool:
         """Apply configured temperature correction to the device, if any."""
         correction = self._get_options().get(
             CONF_TEMPERATURE_CORRECTION,
             self._config_entry.data.get(CONF_TEMPERATURE_CORRECTION) if self._config_entry else None,
         )
         if correction is None:
-            return
+            return True
         try:
-            await self.convector.set_temperature_correction(int(correction), source="climate._apply_stored_temperature_correction")
+            result = await self.convector.set_temperature_correction(int(correction), source="climate._apply_stored_temperature_correction")
+            if isinstance(result, dict) and "error" in result:
+                raise DeviceCommandError(f"Could not apply temperature correction: {result['error']}")
             _LOGGER.debug(
                 "Applied stored temperature correction %s°C after reconnect",
                 correction,
             )
+            data = getattr(self.hass, "data", {}).get(DOMAIN, {}).get(self._config_entry.entry_id)
+            if data is not None:
+                data["applied_correction"] = int(correction)
+                data["correction_pending"] = False
+            return True
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning(
                 "Failed to re-apply temperature correction after reconnect: %s",
                 exc,
             )
+            return False
 
     def _persist_setpoint(self, temp: float) -> None:
         """Save the Heat setpoint to options so it survives reboots."""
@@ -296,25 +312,32 @@ class TesyConvectorClimate(ClimateEntity):
     # ------------------------------------------------------------------
 
     async def async_added_to_hass(self):
+        self._boot_state_unreconciled = not getattr(self.hass, "is_running", True)
+        self._startup_read_only = self._boot_state_unreconciled
+        data = getattr(self.hass, "data", {}).get(DOMAIN, {}).get(self._config_entry.entry_id, {})
+        self._startup_correction_pending = self._startup_read_only or data.get("correction_pending", False)
         self._sw_learning_store = Store(
             self.hass, 1, f"{DOMAIN}.{self._config_entry.entry_id}.sw_learning"
         )
         self._sw_restore_pending = await self._sw_learning_store.async_load()
-        self._remove_update_listener = async_track_time_interval(
-            self.hass, self.async_update, timedelta(seconds=10)
-        )
+        if not getattr(self.hass, "is_running", True):
+            self._startup_sensor_deadline = self.hass.loop.time() + 60
 
         # ── Boot sequence ────────────────────────────────────────────────
-        # 1. Always clear window-open state on the device.  If HA crashed
+        # HA startup only reads status. The restoration steps below apply to
+        # integration reloads while HA is already running.
+        # 1. Clear window-open state on the device during a running-HA reload.
+        # If HA crashed
         #    or restarted while a window event was active, the device may
         #    still have setOpenedWindow=on which would block heating.
         #    Also resets all in-memory window detection state so the
         #    temperature history starts fresh and cannot cause a false
         #    window-open detection from stale pre-boot readings.
-        try:
-            await self.convector.set_opened_window("off", source="climate.async_added_to_hass")
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("Boot: could not clear window state on device: %s", exc)
+        if not self._startup_read_only:
+            try:
+                await self.convector.set_opened_window("off", source="climate.async_added_to_hass")
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("Boot: could not clear window state on device: %s", exc)
 
         # Reset every piece of window detection state explicitly
         self._window_opened = False
@@ -343,7 +366,9 @@ class TesyConvectorClimate(ClimateEntity):
         # For OFF and AUTO: call async_set_hvac_mode normally so the
         # device is put in the right state immediately.
         saved_mode = self._get_options().get(CONF_LAST_HVAC_MODE)
-        if saved_mode and saved_mode in [m.value for m in [HVACMode.HEAT, HVACMode.OFF, HVACMode.AUTO]]:
+        if self._startup_read_only:
+            await self.async_update()
+        elif saved_mode and saved_mode in [m.value for m in [HVACMode.HEAT, HVACMode.OFF, HVACMode.AUTO]]:
             restored_mode = HVACMode(saved_mode)
             options = self._get_options()
             sw_control = options.get(CONF_SW_CONTROL_ENABLED, False)
@@ -359,6 +384,10 @@ class TesyConvectorClimate(ClimateEntity):
                 self._hvac_mode = restored_mode
                 self._pending_boot_mode = restored_mode
                 await self.async_update()
+        # Register only after boot work, avoiding overlapping startup polls.
+        self._remove_update_listener = async_track_time_interval(
+            self.hass, self.async_update, timedelta(seconds=10)
+        )
 
     async def async_will_remove_from_hass(self):
         if self._remove_update_listener:
@@ -371,6 +400,12 @@ class TesyConvectorClimate(ClimateEntity):
 
     async def async_update(self, *args):
         """Keep transient control failures from aborting entity setup or polls."""
+        if self._update_lock.locked():
+            return
+        async with self._update_lock:
+            await self._async_update_guarded(*args)
+
+    async def _async_update_guarded(self, *args):
         try:
             await self._async_update(*args)
         except DeviceCommandError as exc:
@@ -419,7 +454,7 @@ class TesyConvectorClimate(ClimateEntity):
                 return
             _LOGGER.debug("Tesy Convector: retry attempt after %.0fs", elapsed)
 
-        if self._pending_boot_mode is not None:
+        if self._pending_boot_mode is not None and not self._startup_read_only:
             await self.async_set_hvac_mode(self._pending_boot_mode)
             self._pending_boot_mode = None
 
@@ -439,7 +474,9 @@ class TesyConvectorClimate(ClimateEntity):
             if not self._attr_available:
                 _LOGGER.info("Tesy Convector is back online — restoring availability")
                 self._attr_available = True
-                await self._apply_stored_temperature_correction()
+                # A reset may have discarded the configured correction.
+                # Use the same acknowledged, retryable path as startup.
+                self._startup_correction_pending = True
                 self.async_write_ha_state()
 
             # When sw-control is active the device is frequently turned off
@@ -454,6 +491,18 @@ class TesyConvectorClimate(ClimateEntity):
             # is NOT active.  When sw-control is active, _hvac_mode is owned
             # by HA and must only change through explicit user actions.
             device_on = status["payload"]["onOff"]["payload"]["status"] == "on"
+            self._firmware_heating_mode = (
+                device_on and status["payload"].get("setMode", {}).get("payload", {}).get("name") == "heating"
+            )
+            if self._boot_state_unreconciled or self._startup_read_only:
+                self._boot_state_unreconciled = False
+                device_mode = status["payload"].get("setMode", {}).get("payload", {}).get("name")
+                self._hvac_mode = HVACMode.OFF if not device_on else (
+                    HVACMode.AUTO if device_mode == "program" else HVACMode.HEAT
+                )
+                self._pending_boot_mode = None
+                self._reset_sw_controller()
+                _LOGGER.debug("Boot: reporting actual device mode %s", self._hvac_mode)
             if self._sw_was_enabled and not sw_control:
                 if self._target_temp is not None:
                     await self._set_firmware_target()
@@ -585,6 +634,32 @@ class TesyConvectorClimate(ClimateEntity):
             self._current_temp = (
                 external_temp if external_temp is not None else self._extract_internal_temp(status)
             )
+            # A very short power cycle may occur entirely between polls.
+            # When status includes the correction, detect its reset directly.
+            correction = self._get_options().get(
+                CONF_TEMPERATURE_CORRECTION, self._config_entry.data.get(CONF_TEMPERATURE_CORRECTION)
+            )
+            node = status["payload"].get("setTCorrection")
+            reported = node.get("payload") if isinstance(node, dict) else None
+            reported = reported.get("temp") if isinstance(reported, dict) else None
+            if correction is not None and reported is not None and not isinstance(reported, bool):
+                try:
+                    value = float(reported)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if math.isfinite(value) and -4 <= value <= 4 and value != int(correction):
+                        self._startup_correction_pending = True
+            if self._startup_read_only:
+                if not getattr(self.hass, "is_running", True):
+                    self._update_hvac_action()
+                    return
+                self._startup_read_only = False
+            if self._startup_correction_pending:
+                if correction is not None and not await self._apply_stored_temperature_correction():
+                    self._comm_failed_at = now_mono
+                    return
+                self._startup_correction_pending = False
             if external_temp is None:
                 self._temp_history = []
                 self._window_detection_ready = False
@@ -594,7 +669,19 @@ class TesyConvectorClimate(ClimateEntity):
                     await self._close_window(now_mono)
 
             if sw_control and self._hvac_mode == HVACMode.HEAT and external_temp is None:
+                if self._startup_sensor_deadline is not None and now_mono < self._startup_sensor_deadline:
+                    if not self._startup_target_applied:
+                        # Preserve an intentional SW OFF (10 C) while waiting
+                        # for room feedback. Only lower a retained high ceiling;
+                        # never start heating by raising a low startup setpoint.
+                        if self._target_temp is not None and device_settemp > math.ceil(self._target_temp):
+                            await self._set_firmware_target()
+                        self._startup_target_applied = True
+                    self._update_hvac_action()
+                    return
                 await self._enter_firmware_fallback(self._external_temp_reason)
+            if external_temp is not None:
+                self._startup_sensor_deadline = None
 
             await self._handle_window_detection(
                 window_open_enabled=window_open_enabled,
@@ -625,6 +712,10 @@ class TesyConvectorClimate(ClimateEntity):
             self._update_hvac_action()
         else:
             if "error" in status:
+                # Even a brief reset can erase the device's volatile correction.
+                # Reapply after the next successful poll, without waiting for
+                # the three-failure UI availability threshold.
+                self._startup_correction_pending = True
                 self._comm_failed_at = now_mono
                 self._comm_failures += 1
                 if self._comm_failures >= 3 and self._attr_available:
@@ -773,9 +864,10 @@ class TesyConvectorClimate(ClimateEntity):
         # Set the safety target before enabling heating. Failed writes must
         # remain retryable rather than claiming that fallback was applied.
         await self._set_firmware_target()
-        result = await self.convector.set_mode("heating", source="climate._enter_firmware_fallback")
-        if isinstance(result, dict) and "error" in result:
-            raise DeviceCommandError(f"Could not enable firmware heating: {result['error']}")
+        if self._firmware_heating_mode is not True:
+            result = await self.convector.set_mode("heating", source="climate._enter_firmware_fallback")
+            if isinstance(result, dict) and "error" in result:
+                raise DeviceCommandError(f"Could not enable firmware heating: {result['error']}")
         self._reset_sw_controller()
         self._sw_fallback_active = True
         if self._current_temp is not None:
@@ -889,7 +981,7 @@ class TesyConvectorClimate(ClimateEntity):
         result = await self.convector.set_temperature(device_target, source="climate._run_sw_controller")
         if isinstance(result, dict) and "error" in result:
             raise DeviceCommandError(f"Could not apply SW phase: {result['error']}")
-        if self._sw_device_on is None:
+        if self._sw_device_on is None and self._firmware_heating_mode is not True:
             result = await self.convector.set_mode("heating", source="climate._run_sw_controller")
             if isinstance(result, dict) and "error" in result:
                 raise DeviceCommandError(f"Could not enable SW heating mode: {result['error']}")
@@ -1466,13 +1558,19 @@ class TesyConvectorClimate(ClimateEntity):
         if hvac_mode == HVACMode.HEAT:
             if not sw_control:
                 await self._set_firmware_target()
-            await self.convector.set_mode("heating", source="climate.async_set_hvac_mode")
+            result = await self.convector.set_mode("heating", source="climate.async_set_hvac_mode")
+            if isinstance(result, dict) and "error" in result:
+                raise DeviceCommandError(f"Could not enable heating: {result['error']}")
         elif hvac_mode == HVACMode.OFF:
-            await self.convector.turn_off(source="climate.async_set_hvac_mode")
+            result = await self.convector.turn_off(source="climate.async_set_hvac_mode")
+            if isinstance(result, dict) and "error" in result:
+                raise DeviceCommandError(f"Could not turn off heater: {result['error']}")
             await self._set_firmware_target()
         elif hvac_mode == HVACMode.AUTO:
             await self._set_firmware_target()
-            await self.convector.set_mode("program", source="climate.async_set_hvac_mode")
+            result = await self.convector.set_mode("program", source="climate.async_set_hvac_mode")
+            if isinstance(result, dict) and "error" in result:
+                raise DeviceCommandError(f"Could not enable program mode: {result['error']}")
         self._reset_sw_controller()
         self._sw_fallback_active = False
         await asyncio.sleep(0.1)

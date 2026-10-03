@@ -59,6 +59,7 @@ class MemoryStore:
 
 sys.modules.setdefault('homeassistant', types.ModuleType('homeassistant'))
 sys.modules.setdefault('homeassistant.core', types.SimpleNamespace(HomeAssistant=object))
+sys.modules.setdefault('homeassistant.exceptions', types.SimpleNamespace(HomeAssistantError=type('HomeAssistantError', (Exception,), {})))
 sys.modules.setdefault('homeassistant.components.climate', types.SimpleNamespace(ClimateEntity=ClimateEntity))
 sys.modules.setdefault('homeassistant.components.climate.const', types.SimpleNamespace(
     HVACMode=HVACMode, HVACAction=HVACAction, ClimateEntityFeature=ClimateEntityFeature,
@@ -400,7 +401,7 @@ def test_failed_headroom_write_does_not_claim_an_applied_adjustment(entity):
     run(entity, 21.0)
     run(entity, 21.0, dt=60)
     entity.convector.set_temperature = AsyncMock(return_value={'error': 'timeout'})
-    with pytest.raises(RuntimeError):
+    with pytest.raises(climate.DeviceCommandError):
         run(entity, 21.0, dt=60)
     assert entity._sw_headroom == 0
     assert entity._sw_applied_setpoint == 22
@@ -662,7 +663,7 @@ def test_target_change_while_in_fallback_uses_floor(entity):
 
 def test_failed_fallback_write_is_retried(entity):
     entity.convector.set_temperature = AsyncMock(side_effect=[{'error': 'offline'}, {}])
-    with pytest.raises(RuntimeError, match='restore firmware target'):
+    with pytest.raises(climate.DeviceCommandError, match='restore firmware target'):
         asyncio.run(entity._enter_firmware_fallback('missing'))
     assert not entity._sw_fallback_active
     asyncio.run(entity._enter_firmware_fallback('missing'))
@@ -733,7 +734,7 @@ def test_external_mode_change_clears_controller_ownership(entity, on, mode):
 
 def test_failed_mode_write_does_not_claim_fallback(entity):
     entity.convector.set_mode = AsyncMock(side_effect=[{'error': 'offline'}, {}])
-    with pytest.raises(RuntimeError, match='enable firmware heating'):
+    with pytest.raises(climate.DeviceCommandError, match='enable firmware heating'):
         asyncio.run(entity._enter_firmware_fallback('missing'))
     assert not entity._sw_fallback_active
     asyncio.run(entity._enter_firmware_fallback('missing'))
@@ -742,6 +743,8 @@ def test_failed_mode_write_does_not_claim_fallback(entity):
 
 @pytest.mark.parametrize('method', ['set_temperature', 'set_mode'])
 def test_restart_fallback_connection_reset_keeps_entity_and_retries(entity, method, caplog):
+    if method == 'set_mode':
+        entity.convector.on = False
     entity._config_entry.options.update({
         const.CONF_LAST_HVAC_MODE: 'heat', const.CONF_LAST_SETPOINT: 22.0,
     })
@@ -794,6 +797,235 @@ def test_restart_off_target_failure_preserves_pending_mode_until_retry(entity):
     assert entity._pending_boot_mode is None
     assert entity.hvac_mode == HVACMode.OFF
     assert not entity.convector.on
+
+
+@pytest.mark.parametrize('device_on,device_mode,expected', [
+    (False, 'heating', HVACMode.OFF),
+    (True, 'heating', HVACMode.HEAT),
+    (True, 'program', HVACMode.AUTO),
+])
+def test_ha_startup_reports_actual_mode_without_writes(entity, device_on, device_mode, expected):
+    entity.hass.is_running = False
+    entity.convector.on = device_on
+    entity.convector.mode = device_mode
+    entity._config_entry.options.update({
+        const.CONF_LAST_HVAC_MODE: 'heat' if expected != HVACMode.HEAT else 'off',
+        const.CONF_LAST_SETPOINT: 22.5,
+    })
+    entity.sensor = sensor('unavailable')
+    asyncio.run(entity.async_added_to_hass())
+    assert entity.hvac_mode == expected
+    assert entity.convector.calls == []
+    assert not entity._sw_fallback_active
+    poll(entity, 'unavailable', dt=30)
+    assert entity.convector.calls == []
+    assert entity.hvac_mode == expected
+
+
+def test_ha_startup_status_tracks_changes_and_leaves_off_after_start(entity):
+    entity.hass.is_running = False
+    entity._config_entry.options[const.CONF_LAST_HVAC_MODE] = 'heat'
+    entity.convector.on = False
+    asyncio.run(entity.async_added_to_hass())
+    assert entity.hvac_mode == HVACMode.OFF
+    entity.convector.on = True
+    poll(entity, 21.0)
+    assert entity.hvac_mode == HVACMode.HEAT
+    entity.convector.on = False
+    poll(entity, 21.0)
+    assert entity.hvac_mode == HVACMode.OFF
+    entity.hass.is_running = True
+    poll(entity, 21.0)
+    assert entity.hvac_mode == HVACMode.OFF
+    assert entity.convector.calls == []
+
+
+def test_ha_startup_waits_for_room_sensor_then_reuses_existing_heating_mode(entity):
+    entity.hass.is_running = False
+    entity._config_entry.options.update({
+        const.CONF_LAST_HVAC_MODE: 'heat', const.CONF_LAST_SETPOINT: 22.0,
+    })
+    entity.sensor = sensor('unavailable')
+    asyncio.run(entity.async_added_to_hass())
+    assert entity.convector.calls == []
+    entity.hass.is_running = True
+    poll(entity, 'unavailable', dt=10)
+    assert not entity._sw_fallback_active
+    assert entity.convector.calls == []
+    poll(entity, 21.6, dt=10)
+    assert entity._sw_device_on is True
+    assert ('mode', 'heating') not in entity.convector.calls
+
+
+def test_ha_startup_missing_sensor_falls_back_after_bounded_wait(entity):
+    entity.hass.is_running = False
+    entity._config_entry.options.update({
+        const.CONF_LAST_HVAC_MODE: 'heat', const.CONF_LAST_SETPOINT: 22.0,
+    })
+    entity.sensor = sensor('unavailable')
+    asyncio.run(entity.async_added_to_hass())
+    entity.hass.is_running = True
+    poll(entity, 'unavailable', dt=60)
+    assert entity._sw_fallback_active
+    assert ('mode', 'heating') not in entity.convector.calls
+
+
+@pytest.mark.parametrize('room,expected_setpoint', [(22.5, 10), (21.0, 23)])
+def test_ha_restart_during_software_off_preserves_low_setpoint_until_sensor_ready(entity, room, expected_setpoint):
+    entity.hass.is_running = False
+    entity.convector.on = True
+    entity.convector.mode = 'heating'
+    entity.convector.setpoint = 10
+    entity._config_entry.options.update({
+        const.CONF_LAST_HVAC_MODE: 'heat', const.CONF_LAST_SETPOINT: 22.5,
+    })
+    entity.sensor = sensor('unavailable')
+    asyncio.run(entity.async_added_to_hass())
+    assert entity.hvac_mode == HVACMode.HEAT
+    assert entity.convector.calls == []
+    entity.hass.is_running = True
+    poll(entity, 'unavailable', dt=10)
+    assert entity.convector.setpoint == 10
+    assert entity.convector.calls == []
+    poll(entity, room, dt=10)
+    assert entity.convector.setpoint == expected_setpoint
+    assert entity.hvac_mode == HVACMode.HEAT
+    assert ('mode', 'heating') not in entity.convector.calls
+
+
+def test_mode_command_failure_is_a_normal_ha_error_and_not_saved(entity):
+    entity.convector.turn_off = AsyncMock(return_value={'error': 'connection reset'})
+    with pytest.raises(climate.HomeAssistantError, match='Could not turn off heater'):
+        asyncio.run(entity.async_set_hvac_mode(HVACMode.OFF))
+    assert entity.hvac_mode == HVACMode.HEAT
+    assert const.CONF_LAST_HVAC_MODE not in entity._config_entry.options
+
+
+@pytest.mark.parametrize('correction', [0, 3, -2])
+def test_saved_correction_sent_after_ha_startup_even_when_heater_off(entity, correction):
+    entity.hass.is_running = False
+    entity.convector.on = False
+    entity._config_entry.options[const.CONF_TEMPERATURE_CORRECTION] = correction
+    entity.convector.set_temperature_correction = AsyncMock(return_value={})
+    entity.hass.data = {const.DOMAIN: {entity._config_entry.entry_id: {'device': entity.convector}}}
+    asyncio.run(entity.async_added_to_hass())
+    entity.convector.set_temperature_correction.assert_not_awaited()
+    poll(entity, 'unavailable')
+    entity.convector.set_temperature_correction.assert_not_awaited()
+    entity.hass.is_running = True
+    poll(entity, 'unavailable')
+    entity.convector.set_temperature_correction.assert_awaited_once_with(
+        correction, source='climate._apply_stored_temperature_correction',
+    )
+    assert not entity._startup_correction_pending
+    assert entity.hass.data[const.DOMAIN]['test']['applied_correction'] == correction
+    assert entity.hvac_mode == HVACMode.OFF
+    poll(entity, 'unavailable')
+    assert entity.convector.set_temperature_correction.await_count == 1
+
+
+def test_startup_correction_reset_retries_and_only_clears_pending_on_success(entity):
+    entity.hass.is_running = False
+    entity.convector.on = False
+    entity._config_entry.data[const.CONF_TEMPERATURE_CORRECTION] = 3
+    entity.convector.set_temperature_correction = AsyncMock(side_effect=[
+        {'error': '[Errno 104] Connection reset by peer'}, {},
+    ])
+    asyncio.run(entity.async_added_to_hass())
+    entity.hass.is_running = True
+    poll(entity, 21.6)
+    assert entity._startup_correction_pending
+    poll(entity, 21.6, dt=2)
+    assert entity.convector.set_temperature_correction.await_count == 1
+    poll(entity, 21.6, dt=8)
+    assert not entity._startup_correction_pending
+    assert entity.convector.set_temperature_correction.await_count == 2
+    assert entity.hvac_mode == HVACMode.OFF
+
+
+def test_correction_pending_survives_ha_starting_between_integration_and_entity_setup(entity):
+    entity.hass.is_running = True
+    entity._config_entry.options[const.CONF_TEMPERATURE_CORRECTION] = 2
+    entity.hass.data = {const.DOMAIN: {'test': {'device': entity.convector, 'correction_pending': True}}}
+    entity.convector.set_temperature_correction = AsyncMock(return_value={})
+    asyncio.run(entity.async_added_to_hass())
+    poll(entity, 21.6)
+    entity.convector.set_temperature_correction.assert_awaited_once_with(
+        2, source='climate._apply_stored_temperature_correction',
+    )
+    assert not entity.hass.data[const.DOMAIN]['test']['correction_pending']
+
+
+@pytest.mark.parametrize('heater_on', [True, False])
+def test_correction_after_unavailability_retries_failed_write(entity, heater_on):
+    entity.convector.on = heater_on
+    entity._hvac_mode = HVACMode.HEAT if heater_on else HVACMode.OFF
+    entity._config_entry.options[const.CONF_TEMPERATURE_CORRECTION] = 3
+    entity.convector.set_temperature_correction = AsyncMock(side_effect=[
+        {'error': 'connection reset'}, {},
+    ])
+    original_status = entity.convector.get_status
+    entity.convector.get_status = AsyncMock(return_value={'error': 'offline'})
+    for _ in range(3):
+        poll(entity, 21.6)
+    assert not entity._attr_available
+    entity.convector.set_temperature_correction.assert_not_awaited()
+    entity.convector.get_status = original_status
+    poll(entity, 21.6, dt=30)
+    assert entity._attr_available
+    assert entity._startup_correction_pending
+    assert entity.convector.set_temperature_correction.await_count == 1
+    poll(entity, 21.6, dt=2)
+    assert entity.convector.set_temperature_correction.await_count == 1
+    poll(entity, 21.6, dt=8)
+    assert not entity._startup_correction_pending
+    assert entity.convector.set_temperature_correction.await_count == 2
+    poll(entity, 21.6)
+    assert entity.convector.set_temperature_correction.await_count == 2
+    assert entity.convector.on is heater_on
+
+
+def test_short_power_cycle_reapplies_correction_without_availability_drop(entity):
+    entity._config_entry.options[const.CONF_TEMPERATURE_CORRECTION] = 3
+    entity.convector.set_temperature_correction = AsyncMock(return_value={})
+    original_status = entity.convector.get_status
+    entity.convector.get_status = AsyncMock(return_value={'error': 'offline'})
+    poll(entity, 21.6)
+    entity.convector.get_status = original_status
+    poll(entity, 21.6)
+    assert entity._attr_available
+    entity.convector.set_temperature_correction.assert_awaited_once_with(
+        3, source='climate._apply_stored_temperature_correction',
+    )
+    poll(entity, 21.6)
+    assert entity.convector.set_temperature_correction.await_count == 1
+
+
+def test_power_cycle_between_polls_is_detected_by_reported_correction_reset(entity):
+    entity._config_entry.options[const.CONF_TEMPERATURE_CORRECTION] = 3
+    reported = [3]
+    original_status = entity.convector.get_status
+
+    async def status(**kwargs):
+        value = await original_status(**kwargs)
+        value['payload']['setTCorrection'] = {'payload': {'temp': reported[0]}}
+        return value
+
+    async def apply(value, **kwargs):
+        reported[0] = value
+        return {}
+
+    entity.convector.get_status = status
+    entity.convector.set_temperature_correction = AsyncMock(side_effect=apply)
+    poll(entity, 21.6)
+    entity.convector.set_temperature_correction.assert_not_awaited()
+    reported[0] = 0  # reboot between status polls, with no observed network error
+    poll(entity, 21.6)
+    entity.convector.set_temperature_correction.assert_awaited_once_with(
+        3, source='climate._apply_stored_temperature_correction',
+    )
+    poll(entity, 21.6)
+    assert entity.convector.set_temperature_correction.await_count == 1
 
 
 def test_sensor_change_seeds_new_history(entity):

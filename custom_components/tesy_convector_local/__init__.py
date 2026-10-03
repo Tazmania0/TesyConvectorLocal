@@ -32,10 +32,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         CONF_TEMPERATURE_CORRECTION,
         entry.data.get(CONF_TEMPERATURE_CORRECTION),
     )
-    if correction is not None:
-        await device.set_temperature_correction(correction)
+    data = {"device": device, "correction_pending": correction is not None}
+    if correction is not None and getattr(hass, "is_running", True):
+        result = await device.set_temperature_correction(correction)
+        if not isinstance(result, dict) or "error" not in result:
+            data["applied_correction"] = correction
+            data["correction_pending"] = False
 
-    hass.data[DOMAIN][entry.entry_id] = {"device": device}
+    hass.data[DOMAIN][entry.entry_id] = data
     # Diagnostic entities depend on the climate instance. HA may set up the
     # platforms in a single batch concurrently, so establish climate first.
     await hass.config_entries.async_forward_entry_setups(entry, ["climate"])
@@ -48,9 +52,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Apply updated options live without reloading the config entry."""
     correction = entry.options.get(CONF_TEMPERATURE_CORRECTION)
-    if correction is not None:
-        device = hass.data[DOMAIN][entry.entry_id]["device"]
-        await device.set_temperature_correction(correction)
+    data = hass.data[DOMAIN][entry.entry_id]
+    if getattr(hass, "is_running", True) and correction is not None and correction != data.get("applied_correction"):
+        result = await data["device"].set_temperature_correction(correction)
+        if not isinstance(result, dict) or "error" not in result:
+            data["applied_correction"] = correction
+            data["correction_pending"] = False
     await _async_sync_cloud_telemetry(hass, entry)
 
 

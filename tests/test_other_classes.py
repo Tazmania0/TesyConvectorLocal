@@ -283,11 +283,26 @@ def test_integration_options_update_only_writes_when_correction_present():
         entry_id="entry-1", options={const.CONF_TEMPERATURE_CORRECTION: -1}
     )
     asyncio.run(integration._async_options_updated(hass, entry_with_correction))
+    asyncio.run(integration._async_options_updated(hass, entry_with_correction))
 
     entry_without_correction = _DummyEntry(entry_id="entry-1", options={})
     asyncio.run(integration._async_options_updated(hass, entry_without_correction))
 
     assert device.calls == [-1]
+
+
+def test_integration_setup_does_not_write_correction_during_ha_startup():
+    device = _DummyDevice()
+    entry = _DummyEntry(
+        data={const.CONF_IP_ADDRESS: '192.0.2.1', const.CONF_MODEL: 'CN03'},
+        options={const.CONF_TEMPERATURE_CORRECTION: 2},
+    )
+    integration.async_get_clientsession = lambda hass: object()
+    integration.TesyConvector = lambda ip, model, session: device
+    hass = types.SimpleNamespace(data={}, is_running=False, config_entries=_DummyConfigEntryManager())
+    asyncio.run(integration.async_setup_entry(hass, entry))
+    asyncio.run(integration._async_options_updated(hass, entry))
+    assert device.calls == []
 
 
 def test_window_service_removed_only_after_last_entry_unloads():

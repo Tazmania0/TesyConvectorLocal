@@ -29,11 +29,20 @@ class TesyConvector:
         self._unavailable_logged = False
         self._json_error_logged = False
         self._request_lock = asyncio.Lock()
+        self._next_request_at = 0.0
 
     async def send_command(self, endpoint, payload, source=None):
         """Serialize requests to the heater's limited local HTTP server."""
         async with self._request_lock:
-            return await self._send_command(endpoint, payload, source)
+            delay = self._next_request_at - monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                return await self._send_command(endpoint, payload, source)
+            finally:
+                # The firmware can reset back-to-back connections even when
+                # requests don't overlap. Give its HTTP server time to settle.
+                self._next_request_at = monotonic() + 0.5
 
     async def _send_command(self, endpoint, payload, source=None):
         """Send once; never replay a potentially applied control write."""

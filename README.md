@@ -38,6 +38,28 @@ sensor, target, and tuning settings still match. The heater phase, timers, EMA,
 temperature histories, and unfinished coast are always initialized afresh.
 Duty cycle remains a diagnostic; heating decisions continue to use live feedback.
 
+During Home Assistant startup, initialization reads the convector's actual
+status without writing mode, power, window settings, or temperature correction.
+`onOff=off` reports OFF even when the device's stored mode says heating or HA
+remembers HEAT. An ON device reports its heating or program mode. Saved-mode
+restoration during a running-HA integration reload retains its existing policy.
+After HA starts, normal control resumes for an ON heater. A missing room sensor
+has a bounded 60-second startup window before firmware fallback; an OFF heater
+stays OFF. Local requests are serialized with a 0.5-second settling gap, and
+an already active heating mode is reused instead of issuing another `setMode`.
+The saved temperature correction is sent after HA starts, even when the heater
+is OFF or the room sensor is unavailable. It stays pending through failed writes
+and is retried on later polls until acknowledged; this never turns the heater ON.
+The same retryable correction restore runs after any communication failure,
+once status polling succeeds again. This also covers a brief power cycle that
+never reaches the three-failure threshold for showing the heater unavailable.
+If status reports a correction different from the saved value, it is restored
+even when the power cycle occurred entirely between polls.
+An intentional software OFF phase retains `onOff=on` with a 10°C setpoint:
+startup reports HEAT intent and preserves that low setpoint while waiting for
+the room sensor, then decides ON/OFF from fresh feedback. An unavailable sensor
+past the startup window invokes firmware fallback at the ordinary room target.
+
 Entity attributes expose sensor validity and age, filtered temperature,
 controller state, firmware fallback, prediction, effective cutoff, learned
 overshoot correction, slow average correction, and completed-cycle duty.
