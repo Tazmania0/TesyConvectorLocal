@@ -93,6 +93,43 @@ is an estimate based on the internal sensor reaching the safety setpoint.
 See [temperature-control assessment](docs/temperature-control.md) for simulation
 results, limitations, and how to compare software control with firmware in a room.
 
+## Optional MyTESY cloud heating telemetry
+
+An optional, experimental connection can show the heater's reported heating
+activity separately from the software heat request. It uses the MyTESY Android
+app's cloud discovery and MQTT protocol; it does not publish heater commands.
+This protocol is unofficial and has not yet been verified with a live account.
+
+In the integration's **Configure** options, enable **Use MyTESY cloud heating
+telemetry**, sign in to MyTESY, then select the same physical heater. The account
+password is used only for discovery and is not saved. The selected device token
+and MQTT credentials are saved in Home Assistant's config entry. To select a
+different heater or refresh credentials, check **Choose or reconnect cloud device**.
+Unchecking the telemetry option stops the subscription without restarting local
+temperature control; the saved connection details remain available for re-enabling.
+
+The device page gains **Device reported heating**, **Cloud device temperature**,
+**Cloud telemetry connected**, and **Cloud heating report age** diagnostics.
+They use the same Recorder exclusion naming pattern documented above and do not
+generate long-term statistics. The reported device temperature is telemetry;
+the selected external room sensor remains the controller's feedback.
+
+While enabled, fresh reports supply the climate Heating/Idle indicator. Missing
+reports, disconnects, and reports older than 180 seconds make the heating
+indicator unknown. Local OFF/window inhibition still displays Off. Unknown
+telemetry does not change the controller's requested phase or firmware fallback.
+Cloud connectivity alone does not prove a fresh heating report. Requested duty
+cycle remains a record of commands, not element runtime or measured power.
+
+This uses a separate secure WebSocket MQTT connection and does not require or
+change Home Assistant's own MQTT broker configuration. Reconnects back off to
+five minutes. If discovery reports no devices, verify the heater is in MyTESY's
+current cloud device list; legacy tesyCloud devices are not supported here.
+After installation, enable it and compare Device reported heating with MyTESY
+through an observed heating/idle cycle before relying on the new indicator.
+See [API investigation](docs/mytesy-api-investigation.md) for protocol evidence
+and local endpoint probe results.
+
 ## Tested with:
 - Tesy Convector CN06AS
 

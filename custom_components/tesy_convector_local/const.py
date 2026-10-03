@@ -1,6 +1,10 @@
 """Constants for Tesy Convector Local integration."""
 
 DOMAIN = "tesy_convector_local"
+CONF_CLOUD_TELEMETRY_ENABLED = "cloud_telemetry_enabled"
+CONF_CLOUD_TELEMETRY_RECONFIGURE = "cloud_telemetry_reconfigure"
+CONF_CLOUD_TELEMETRY = "cloud_telemetry"
+CLOUD_TELEMETRY_MAX_AGE_SEC = 180
 
 # FIX: binary_sensor was missing — must match _PLATFORMS in __init__.py.
 # PLATFORMS is kept here for reference but __init__.py uses its own _PLATFORMS list

@@ -765,3 +765,45 @@ def test_live_diagnostics_are_excluded_from_climate_recorded_attributes(entity):
     assert {'temperature', 'current_temperature', 'hvac_action'}.isdisjoint(
         entity._unrecorded_attributes
     )
+
+
+def test_cloud_report_can_show_idle_while_software_still_requests_heat(entity):
+    from custom_components.tesy_convector_local.cloud import CloudTelemetry
+    from test_cloud import config, report
+
+    entity._config_entry.options[const.CONF_CLOUD_TELEMETRY_ENABLED] = True
+    telemetry = CloudTelemetry(config(), Mock())
+    entity._cloud_telemetry = telemetry
+    poll(entity, 21.6)
+    assert entity._sw_device_on is True
+    assert entity.hvac_action is None
+    telemetry._set_connected(True)
+    telemetry.receive(telemetry.topic, report(heating='off'))
+    entity._update_hvac_action()
+    assert entity.hvac_action == HVACAction.IDLE
+    assert entity.extra_state_attributes['sw_heat_requested'] is True
+    assert entity.extra_state_attributes['cloud_heating'] is False
+    assert set(entity.extra_state_attributes) <= entity._unrecorded_attributes
+    telemetry.receive(telemetry.topic, report(heating='on'))
+    entity._update_hvac_action()
+    assert entity.hvac_action == HVACAction.HEATING
+    telemetry._set_connected(False)
+    entity._update_hvac_action()
+    assert entity.hvac_action is None
+    assert entity._sw_device_on is True
+    entity._config_entry.options[const.CONF_CLOUD_TELEMETRY_ENABLED] = False
+    entity._update_hvac_action()
+    assert entity.hvac_action == HVACAction.HEATING
+
+
+def test_cloud_reporting_works_without_software_control_and_respects_local_off(entity):
+    entity._config_entry.options[const.CONF_SW_CONTROL_ENABLED] = False
+    entity._config_entry.options[const.CONF_CLOUD_TELEMETRY_ENABLED] = True
+    entity._cloud_telemetry = types.SimpleNamespace(heating=True, temperature=23.0, connected=True, age=1)
+    entity._hvac_mode = HVACMode.AUTO
+    entity._update_hvac_action()
+    assert entity.hvac_action == HVACAction.HEATING
+    assert entity.extra_state_attributes['cloud_current_temp'] == 23.0
+    entity._hvac_mode = HVACMode.OFF
+    entity._update_hvac_action()
+    assert entity.hvac_action == HVACAction.OFF

@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.const import EntityCategory
 from homeassistant.helpers.entity import DeviceInfo
 
-from .const import CONF_SW_CONTROL_ENABLED, DOMAIN
+from .const import CONF_CLOUD_TELEMETRY_ENABLED, CONF_SW_CONTROL_ENABLED, DOMAIN
 
 SCAN_INTERVAL = timedelta(seconds=10)
 
@@ -19,6 +19,8 @@ DIAGNOSTIC_BINARY_SENSORS = (
     ("firmware_fallback_active", "Firmware fallback active", "mdi:shield-check"),
     ("sw_heat_requested", "Software heating requested", "mdi:radiator"),
     ("firmware_limit_estimated", "Firmware limiting estimated", "mdi:thermometer-alert"),
+    ("cloud_heating", "Device reported heating", "mdi:radiator"),
+    ("cloud_telemetry_connected", "Cloud telemetry connected", "mdi:cloud-check"),
 )
 
 
@@ -107,6 +109,8 @@ class TesyControllerDiagnosticBinarySensor(BinarySensorEntity):
 
     @property
     def available(self):
+        if self._key.startswith("cloud_"):
+            return self._entry.options.get(CONF_CLOUD_TELEMETRY_ENABLED, False)
         return self._climate.available and self._entry.options.get(CONF_SW_CONTROL_ENABLED, False)
 
     @property

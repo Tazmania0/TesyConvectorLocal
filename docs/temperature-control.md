@@ -56,6 +56,13 @@ minimum prevents that during ordinary room-temperature operation, while the
 firmware can still heat at very low temperatures. Neither requested duty nor
 `hvac_action` is an independently measured power or relay signal.
 
+Optional MyTESY cloud telemetry can replace the climate's requested/estimated
+Heating/Idle indicator with a fresh device-reported heating flag. It does not
+change the software phase, learning, or room feedback. The device-reported flag
+is not an independent electricity measurement. With telemetry enabled but
+missing, stale, or disconnected, the action is unknown rather than inferred from
+the request. This experimental protocol still needs a live-account check.
+
 Firmware-only control continues without Home Assistant or a network connection.
 Software control depends on both. If Home Assistant stops during software OFF,
 the device retains the 10 °C setpoint until control resumes or someone changes it

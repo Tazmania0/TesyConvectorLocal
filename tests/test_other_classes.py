@@ -5,7 +5,7 @@ import sys
 import types
 from pathlib import Path
 from dataclasses import dataclass
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 
 class _NumberEntity:
@@ -227,7 +227,7 @@ def test_binary_sensor_async_setup_entry_adds_entity_when_climate_present():
 
     asyncio.run(binary_sensor.async_setup_entry(hass, entry, _add_entities))
 
-    assert len(added) == 5
+    assert len(added) == 7
     assert isinstance(added[0], binary_sensor.WindowOpenBinarySensor)
 
 
@@ -313,13 +313,13 @@ def test_diagnostic_sensor_setup_groups_enabled_entities_with_heater():
     hass = types.SimpleNamespace(data={const.DOMAIN: {entry.entry_id: {'climate_entity': climate}}})
     added = []
     asyncio.run(sensor.async_setup_entry(hass, entry, added.extend))
-    assert len(added) == 12
+    assert len(added) == 14
     assert len({item._attr_unique_id for item in added}) == len(added)
     for item in added:
         assert item._attr_entity_category == 'diagnostic'
         assert item._attr_entity_registry_enabled_default is True
         assert item._attr_device_info['identifiers'] == {(const.DOMAIN, entry.entry_id)}
-        assert item.available
+        assert item.available is (not item.entity_description.key.startswith('cloud_'))
         assert fnmatchcase(f'sensor.{item.suggested_object_id}', 'sensor.*tesy_diagnostic_*')
         assert item.entity_description.state_class is None
     by_key = {item.entity_description.key: item for item in added}
@@ -377,7 +377,7 @@ def test_diagnostic_entities_do_not_make_device_or_external_sensor_requests():
     device = types.SimpleNamespace(model='CN06AS', get_status=Mock())
     climate = types.SimpleNamespace(convector=device, available=True, extra_state_attributes={})
     entry = _DummyEntry(options={const.CONF_SW_CONTROL_ENABLED: True})
-    numeric = sensor.TesyControllerDiagnosticSensor(climate, entry, sensor.DIAGNOSTIC_SENSORS[0])
+    numeric = sensor.TesyControllerDiagnosticSensor(climate, entry, next(d for d in sensor.DIAGNOSTIC_SENSORS if d.key == 'sw_control_state'))
     binary = binary_sensor.TesyControllerDiagnosticBinarySensor(climate, entry, 'external_temp_valid', 'Valid', 'mdi:thermometer')
     for _ in range(3):
         assert numeric.available
@@ -385,3 +385,82 @@ def test_diagnostic_entities_do_not_make_device_or_external_sensor_requests():
         assert binary.available
         binary.is_on
     device.get_status.assert_not_called()
+
+
+def test_cloud_diagnostics_do_not_depend_on_software_control_or_local_availability():
+    entry = _DummyEntry(options={const.CONF_CLOUD_TELEMETRY_ENABLED: True})
+    climate = _diagnostic_climate({'cloud_heating': False, 'cloud_current_temp': 23.0}, available=False)
+    description = next(d for d in sensor.DIAGNOSTIC_SENSORS if d.key == 'cloud_current_temp')
+    numeric = sensor.TesyControllerDiagnosticSensor(climate, entry, description)
+    binary = binary_sensor.TesyControllerDiagnosticBinarySensor(climate, entry, 'cloud_heating', 'Heating', 'mdi:radiator')
+    assert numeric.available and numeric.native_value == 23.0
+    assert binary.available and binary.is_on is False
+    climate.extra_state_attributes['cloud_heating'] = None
+    climate.extra_state_attributes['cloud_current_temp'] = None
+    assert binary.is_on is None
+    assert numeric.native_value is None
+    entry.options[const.CONF_CLOUD_TELEMETRY_ENABLED] = False
+    assert not numeric.available and not binary.available
+
+
+def test_cloud_options_start_replace_and_stop_subscription_without_resetting_controller(monkeypatch):
+    from custom_components.tesy_convector_local import cloud
+    from test_cloud import config
+
+    instances = []
+    class Telemetry:
+        def __init__(self, settings, on_update):
+            self.config = settings
+            self.start = Mock()
+            self.stop = AsyncMock()
+            instances.append(self)
+
+    monkeypatch.setattr(cloud, 'CloudTelemetry', Telemetry)
+    climate = types.SimpleNamespace(
+        _update_hvac_action=Mock(), async_write_ha_state=Mock(), _reset_sw_controller=Mock(),
+    )
+    entry = _DummyEntry(data={const.CONF_CLOUD_TELEMETRY: config()},
+                        options={const.CONF_CLOUD_TELEMETRY_ENABLED: True})
+    data = {'climate_entity': climate}
+    hass = types.SimpleNamespace(data={const.DOMAIN: {entry.entry_id: data}})
+    asyncio.run(integration._async_sync_cloud_telemetry(hass, entry))
+    assert climate._cloud_telemetry is instances[0]
+    asyncio.run(integration._async_sync_cloud_telemetry(hass, entry))
+    instances[0].start.assert_called_once()
+    entry.data[const.CONF_CLOUD_TELEMETRY] = config(token='replacement-token')
+    asyncio.run(integration._async_sync_cloud_telemetry(hass, entry))
+    instances[0].stop.assert_awaited_once()
+    assert climate._cloud_telemetry is instances[1]
+    entry.options[const.CONF_CLOUD_TELEMETRY_ENABLED] = False
+    asyncio.run(integration._async_sync_cloud_telemetry(hass, entry))
+    instances[1].stop.assert_awaited_once()
+    assert climate._cloud_telemetry is None
+    assert 'cloud_telemetry' not in data
+    climate._reset_sw_controller.assert_not_called()
+
+
+def test_invalid_cloud_configuration_does_not_block_local_setup():
+    climate = types.SimpleNamespace(_update_hvac_action=Mock(), async_write_ha_state=Mock())
+    entry = _DummyEntry(data={const.CONF_CLOUD_TELEMETRY: {}},
+                        options={const.CONF_CLOUD_TELEMETRY_ENABLED: True})
+    data = {'climate_entity': climate}
+    hass = types.SimpleNamespace(data={const.DOMAIN: {entry.entry_id: data}})
+    asyncio.run(integration._async_sync_cloud_telemetry(hass, entry))
+    assert climate._cloud_telemetry is None
+    assert 'cloud_telemetry' not in data
+
+
+def test_unload_stops_cloud_subscription_before_removing_entities():
+    telemetry = types.SimpleNamespace(stop=AsyncMock(), start=Mock())
+    entry = _DummyEntry()
+    async def unload(entry, platforms):
+        telemetry.stop.assert_awaited_once()
+        return True
+    hass = types.SimpleNamespace(
+        data={const.DOMAIN: {entry.entry_id: {'cloud_telemetry': telemetry}}},
+        config_entries=types.SimpleNamespace(async_unload_platforms=unload),
+        services=types.SimpleNamespace(has_service=Mock(return_value=False)),
+    )
+    assert asyncio.run(integration.async_unload_entry(hass, entry))
+    assert entry.entry_id not in hass.data[const.DOMAIN]
+    telemetry.start.assert_not_called()

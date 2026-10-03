@@ -27,9 +27,14 @@ from homeassistant.helpers.selector import (
     EntitySelectorConfig,
     NumberSelector,
     NumberSelectorConfig,
+    TextSelector,
+    TextSelectorConfig,
 )
 
 from .const import (
+    CONF_CLOUD_TELEMETRY,
+    CONF_CLOUD_TELEMETRY_ENABLED,
+    CONF_CLOUD_TELEMETRY_RECONFIGURE,
     CONF_IP_ADDRESS,
     CONF_MODEL,
     CONF_SW_CONTROL_ENABLED,
@@ -92,6 +97,7 @@ def _build_options_schema(
     sw_lag_time: float,
     sw_i_gain: float,
     sw_ema_alpha: float,
+    cloud_telemetry_enabled: bool = False,
 ) -> vol.Schema:
     """Build options schema.
 
@@ -105,6 +111,8 @@ def _build_options_schema(
             CONF_TEMPERATURE_CORRECTION, default=int(correction)
         ): _CORRECTION_SELECTOR,
         vol.Required(CONF_USE_EXTERNAL_TEMP, default=use_external): bool,
+        vol.Optional(CONF_CLOUD_TELEMETRY_ENABLED, default=cloud_telemetry_enabled): bool,
+        vol.Optional(CONF_CLOUD_TELEMETRY_RECONFIGURE, default=False): bool,
     }
 
     if use_external:
@@ -304,10 +312,13 @@ class TesyConvectorOptionsFlowHandler(config_entries.OptionsFlow):
                 # _async_options_updated listener in __init__.py applies
                 # the correction live, and all other params are read fresh
                 # on the next poll cycle (within 10 s).
-                self.hass.config_entries.async_update_entry(
-                    self.config_entry, options=cleaned
-                )
-                return self.async_abort(reason="changes_saved")
+                reconfigure = cleaned.pop(CONF_CLOUD_TELEMETRY_RECONFIGURE, False)
+                if cleaned.get(CONF_CLOUD_TELEMETRY_ENABLED, False) and (
+                    reconfigure or not self.config_entry.data.get(CONF_CLOUD_TELEMETRY)
+                ):
+                    self._pending_options = cleaned
+                    return await self.async_step_cloud_login()
+                return self._save_options(cleaned)
 
             # Re-render with user's just-submitted values on validation error
             schema = _build_options_schema(
@@ -325,6 +336,7 @@ class TesyConvectorOptionsFlowHandler(config_entries.OptionsFlow):
                 sw_lag_time=user_input.get(CONF_SW_LAG_TIME, sw_lag_time),
                 sw_ema_alpha=user_input.get(CONF_SW_EMA_ALPHA, sw_ema_alpha),
                 sw_i_gain=user_input.get(CONF_SW_I_GAIN, sw_i_gain),
+                cloud_telemetry_enabled=user_input.get(CONF_CLOUD_TELEMETRY_ENABLED, False),
             )
             return self.async_show_form(step_id="init", data_schema=schema, errors=errors)
 
@@ -344,5 +356,50 @@ class TesyConvectorOptionsFlowHandler(config_entries.OptionsFlow):
             sw_lag_time=sw_lag_time,
             sw_ema_alpha=sw_ema_alpha,
             sw_i_gain=sw_i_gain,
+            cloud_telemetry_enabled=options.get(CONF_CLOUD_TELEMETRY_ENABLED, False),
         )
         return self.async_show_form(step_id="init", data_schema=schema)
+
+    def _save_options(self, options, cloud_config=None):
+        kwargs = {"options": options}
+        if cloud_config is not None:
+            kwargs["data"] = {**self.config_entry.data, CONF_CLOUD_TELEMETRY: cloud_config}
+        self.hass.config_entries.async_update_entry(self.config_entry, **kwargs)
+        return self.async_abort(reason="changes_saved")
+
+    async def async_step_cloud_login(self, user_input=None):
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession
+        from .cloud import CloudError, async_discover_cloud
+
+        errors = {}
+        if user_input is not None:
+            try:
+                self._cloud_devices = await async_discover_cloud(
+                    async_get_clientsession(self.hass), user_input["email"], user_input["password"]
+                )
+            except CloudError as error:
+                errors["base"] = str(error)
+            else:
+                return await self.async_step_cloud_device()
+        return self.async_show_form(
+            step_id="cloud_login", errors=errors, data_schema=vol.Schema({
+                vol.Required("email"): TextSelector(TextSelectorConfig(type="email")),
+                vol.Required("password"): TextSelector(TextSelectorConfig(type="password")),
+            }),
+        )
+
+    async def async_step_cloud_device(self, user_input=None):
+        errors = {}
+        if user_input is not None:
+            selected = self._cloud_devices.get(user_input.get("cloud_device"))
+            if selected is None:
+                errors["base"] = "invalid_cloud_device"
+            else:
+                result = self._save_options(self._pending_options, selected["config"])
+                self._cloud_devices = {}
+                return result
+        choices = {mac: f"{device['name']} ({mac})" for mac, device in self._cloud_devices.items()}
+        return self.async_show_form(
+            step_id="cloud_device", errors=errors,
+            data_schema=vol.Schema({vol.Required("cloud_device"): vol.In(choices)}),
+        )

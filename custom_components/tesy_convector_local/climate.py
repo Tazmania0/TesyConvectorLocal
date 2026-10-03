@@ -18,6 +18,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 
 from .const import (
+    CONF_CLOUD_TELEMETRY_ENABLED,
     CONF_LAST_HVAC_MODE,
     CONF_LAST_SETPOINT,
     CONF_SW_CONTROL_ENABLED,
@@ -106,6 +107,8 @@ class TesyConvectorClimate(ClimateEntity):
         "firmware_fallback_active", "overshoot_correction", "i_correction",
         "ramp_rate_c_per_min", "predicted_temp", "effective_off_threshold",
         "duty_cycle_pct", "duty_cycles_sampled",
+        "cloud_heating", "cloud_current_temp", "cloud_telemetry_connected",
+        "cloud_telemetry_age_sec",
     })
 
     def __init__(self, convector: TesyConvector, config_entry) -> None:
@@ -113,6 +116,7 @@ class TesyConvectorClimate(ClimateEntity):
         self._device = convector
         self.convector = convector
         self._config_entry = config_entry
+        self._cloud_telemetry = None
         self._remove_update_listener = None
 
         self._attr_name = f"Tesy Convector {convector.model} ({convector.ip_address})"
@@ -1057,8 +1061,8 @@ class TesyConvectorClimate(ClimateEntity):
 
         Called explicitly rather than computed lazily in a property so the
         HA entity state always reflects the correct action immediately.
-        Only valid HVACAction enum values are used so the frontend renders
-        its own translated strings rather than raw arbitrary text.
+        Use HVACAction enum values, or None when enabled cloud telemetry is
+        unknown, so stale reports are never presented as confirmed heating.
         """
         if self._window_opened:
             self._attr_hvac_action = HVACAction.OFF
@@ -1069,6 +1073,13 @@ class TesyConvectorClimate(ClimateEntity):
 
         options = self._get_options()
         sw_control = options.get(CONF_SW_CONTROL_ENABLED, False)
+
+        if options.get(CONF_CLOUD_TELEMETRY_ENABLED, False):
+            reported = self._cloud_telemetry.heating if self._cloud_telemetry is not None else None
+            self._attr_hvac_action = None if reported is None else (
+                HVACAction.HEATING if reported else HVACAction.IDLE
+            )
+            return
 
         if self._hvac_mode == HVACMode.HEAT and sw_control and not self._sw_fallback_active:
             self._attr_hvac_action = HVACAction.HEATING if self._sw_device_on is True else HVACAction.IDLE
@@ -1091,6 +1102,14 @@ class TesyConvectorClimate(ClimateEntity):
         """Expose duty cycle and controller diagnostics as entity attributes."""
         attrs: dict = {}
         options = self._get_options()
+        if options.get(CONF_CLOUD_TELEMETRY_ENABLED, False):
+            telemetry = self._cloud_telemetry
+            attrs.update({
+                "cloud_heating": telemetry.heating if telemetry is not None else None,
+                "cloud_current_temp": telemetry.temperature if telemetry is not None else None,
+                "cloud_telemetry_connected": telemetry.connected if telemetry is not None else False,
+                "cloud_telemetry_age_sec": round(telemetry.age, 1) if telemetry is not None and telemetry.age is not None else None,
+            })
         if not options.get(CONF_SW_CONTROL_ENABLED, False):
             return attrs
         state = "SW_DISABLED"
@@ -1128,7 +1147,7 @@ class TesyConvectorClimate(ClimateEntity):
         return attrs
 
     @property
-    def hvac_action(self) -> HVACAction:
+    def hvac_action(self) -> HVACAction | None:
         """Return the current HVAC action (stored in _attr_hvac_action)."""
         return self._attr_hvac_action
 

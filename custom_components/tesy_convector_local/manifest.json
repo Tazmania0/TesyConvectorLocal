@@ -1,10 +1,10 @@
 {
   "domain": "tesy_convector_local",
   "name": "Tesy Convector Integration",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "documentation": "https://github.com/Tazmania0/TesyConvectorLocal",
   "dependencies": [],
-  "requirements": ["requests"],
+  "requirements": ["requests", "aiomqtt==2.5.1"],
   "codeowners": ["@tazmania0"],
   "config_flow": true,
   "integration_type": "device",

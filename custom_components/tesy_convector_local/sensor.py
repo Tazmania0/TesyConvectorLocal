@@ -10,7 +10,7 @@ from homeassistant.components.sensor import (
 from homeassistant.const import EntityCategory, UnitOfTemperature
 from homeassistant.helpers.entity import DeviceInfo
 
-from .const import CONF_SW_CONTROL_ENABLED, DOMAIN
+from .const import CONF_CLOUD_TELEMETRY_ENABLED, CONF_SW_CONTROL_ENABLED, DOMAIN
 
 # These polls only publish cached values; they never query the heater or sensor.
 SCAN_INTERVAL = timedelta(seconds=10)
@@ -23,9 +23,19 @@ _DIAGNOSTIC_ICONS = {
     "ramp_rate_c_per_min": "mdi:trending-up",
     "overshoot_correction": "mdi:thermometer",
     "i_correction": "mdi:tune",
+    "cloud_telemetry_age_sec": "mdi:timer-outline",
 }
 
 DIAGNOSTIC_SENSORS = (
+    SensorEntityDescription(
+        key="cloud_current_temp", name="Cloud device temperature",
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        device_class=SensorDeviceClass.TEMPERATURE, suggested_display_precision=2,
+    ),
+    SensorEntityDescription(
+        key="cloud_telemetry_age_sec", name="Cloud heating report age",
+        native_unit_of_measurement="s", suggested_display_precision=0,
+    ),
     SensorEntityDescription(
         key="sw_control_state", name="Controller state",
         device_class=SensorDeviceClass.ENUM,
@@ -131,6 +141,8 @@ class TesyControllerDiagnosticSensor(SensorEntity):
 
     @property
     def available(self):
+        if self.entity_description.key.startswith("cloud_"):
+            return self._entry.options.get(CONF_CLOUD_TELEMETRY_ENABLED, False)
         if not self._climate.available:
             return False
         return self.entity_description.key == "sw_control_state" or self._entry.options.get(
