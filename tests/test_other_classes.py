@@ -1,8 +1,10 @@
 import asyncio
+from fnmatch import fnmatchcase
 import importlib.util
 import sys
 import types
 from pathlib import Path
+from dataclasses import dataclass
 from unittest.mock import Mock
 
 
@@ -12,6 +14,21 @@ class _NumberEntity:
 
 class _BinarySensorEntity:
     pass
+
+
+class _SensorEntity:
+    pass
+
+
+@dataclass
+class _SensorEntityDescription:
+    key: str
+    name: str
+    device_class: str | None = None
+    options: list | None = None
+    native_unit_of_measurement: str | None = None
+    state_class: str | None = None
+    suggested_display_precision: int | None = None
 
 
 class _ConfigEntry:
@@ -26,6 +43,20 @@ class _DeviceInfo(dict):
 class _BinarySensorDeviceClass:
     WINDOW = "window"
 
+
+sys.modules.setdefault(
+    "homeassistant.const", types.SimpleNamespace(
+        EntityCategory=types.SimpleNamespace(DIAGNOSTIC="diagnostic"),
+        UnitOfTemperature=types.SimpleNamespace(CELSIUS="°C"),
+    )
+)
+sys.modules.setdefault(
+    "homeassistant.components.sensor", types.SimpleNamespace(
+        SensorEntity=_SensorEntity, SensorEntityDescription=_SensorEntityDescription,
+        SensorDeviceClass=types.SimpleNamespace(TEMPERATURE="temperature", TEMPERATURE_DELTA="temperature_delta", ENUM="enum"),
+        SensorStateClass=types.SimpleNamespace(MEASUREMENT="measurement"),
+    )
+)
 
 # Minimal Home Assistant module stubs used by tested modules.
 sys.modules.setdefault("homeassistant", types.ModuleType("homeassistant"))
@@ -80,6 +111,7 @@ number = _load_module(f"{PKG_NAME}.number", "custom_components/tesy_convector_lo
 binary_sensor = _load_module(
     f"{PKG_NAME}.binary_sensor", "custom_components/tesy_convector_local/binary_sensor.py"
 )
+sensor = _load_module(f"{PKG_NAME}.sensor", "custom_components/tesy_convector_local/sensor.py")
 integration = _load_module(f"{PKG_NAME}.__init__", "custom_components/tesy_convector_local/__init__.py")
 
 
@@ -195,7 +227,7 @@ def test_binary_sensor_async_setup_entry_adds_entity_when_climate_present():
 
     asyncio.run(binary_sensor.async_setup_entry(hass, entry, _add_entities))
 
-    assert len(added) == 1
+    assert len(added) == 5
     assert isinstance(added[0], binary_sensor.WindowOpenBinarySensor)
 
 
@@ -237,7 +269,8 @@ def test_integration_setup_entry_applies_initial_correction_and_forwards_platfor
     assert device.calls == [2]
     assert hass.data[const.DOMAIN][entry.entry_id]["device"] is device
     assert hass.config_entries.forward_calls == [
-        (entry, ["climate", "number", "binary_sensor"])
+        (entry, ["climate"]),
+        (entry, ["number", "binary_sensor", "sensor"]),
     ]
     assert entry.listeners == [integration._async_options_updated]
 
@@ -265,3 +298,90 @@ def test_window_service_removed_only_after_last_entry_unloads():
     services.async_remove.assert_not_called()
     assert asyncio.run(integration.async_unload_entry(hass, _DummyEntry(entry_id='b')))
     services.async_remove.assert_called_once_with(const.DOMAIN, 'set_opened_window')
+
+
+def _diagnostic_climate(attributes=None, available=True):
+    return types.SimpleNamespace(
+        convector=types.SimpleNamespace(model='CN06AS'), available=available,
+        extra_state_attributes=attributes or {},
+    )
+
+
+def test_diagnostic_sensor_setup_groups_enabled_entities_with_heater():
+    entry = _DummyEntry(options={const.CONF_SW_CONTROL_ENABLED: True})
+    climate = _diagnostic_climate({'sw_control_state': 'SW_HEATING', 'duty_cycle_pct': 67})
+    hass = types.SimpleNamespace(data={const.DOMAIN: {entry.entry_id: {'climate_entity': climate}}})
+    added = []
+    asyncio.run(sensor.async_setup_entry(hass, entry, added.extend))
+    assert len(added) == 12
+    assert len({item._attr_unique_id for item in added}) == len(added)
+    for item in added:
+        assert item._attr_entity_category == 'diagnostic'
+        assert item._attr_entity_registry_enabled_default is True
+        assert item._attr_device_info['identifiers'] == {(const.DOMAIN, entry.entry_id)}
+        assert item.available
+        assert fnmatchcase(f'sensor.{item.suggested_object_id}', 'sensor.*tesy_diagnostic_*')
+        assert item.entity_description.state_class is None
+    by_key = {item.entity_description.key: item for item in added}
+    assert by_key['duty_cycle_pct'].native_value == 67
+    assert by_key['duty_cycle_pct'].entity_description.native_unit_of_measurement == '%'
+    assert by_key['sw_control_state'].native_value == 'SW_HEATING'
+    assert by_key['filtered_external_temp'].native_value is None
+    climate.extra_state_attributes['duty_cycle_pct'] = 50
+    assert by_key['duty_cycle_pct'].native_value == 50
+    climate.available = False
+    assert all(not item.available for item in added)
+
+
+def test_diagnostics_support_enabling_software_control_without_reload():
+    entry = _DummyEntry()
+    climate = _diagnostic_climate()
+    entities = {description.key: sensor.TesyControllerDiagnosticSensor(climate, entry, description)
+                for description in sensor.DIAGNOSTIC_SENSORS}
+    assert entities['sw_control_state'].available
+    assert entities['sw_control_state'].native_value == 'SW_DISABLED'
+    assert not entities['duty_cycle_pct'].available
+    entry.options[const.CONF_SW_CONTROL_ENABLED] = True
+    climate.extra_state_attributes.update({'sw_control_state': 'SW_IDLE', 'duty_cycle_pct': 42})
+    assert entities['duty_cycle_pct'].available
+    assert entities['duty_cycle_pct'].native_value == 42
+    assert entities['sw_control_state'].native_value == 'SW_IDLE'
+
+
+def test_temperature_differences_are_not_absolute_temperature_sensors():
+    descriptions = {description.key: description for description in sensor.DIAGNOSTIC_SENSORS}
+    for key in ('overshoot_correction', 'i_correction', 'external_temperature_error'):
+        assert descriptions[key].device_class == 'temperature_delta'
+    assert descriptions['filtered_external_temp'].device_class == 'temperature'
+
+
+def test_controller_binary_diagnostics_follow_flags_and_unknown_values():
+    entry = _DummyEntry(options={const.CONF_SW_CONTROL_ENABLED: True})
+    climate = _diagnostic_climate({'external_temp_valid': True, 'firmware_fallback_active': False})
+    entities = {key: binary_sensor.TesyControllerDiagnosticBinarySensor(climate, entry, key, name, icon)
+                for key, name, icon in binary_sensor.DIAGNOSTIC_BINARY_SENSORS}
+    assert entities['external_temp_valid'].is_on is True
+    assert entities['firmware_fallback_active'].is_on is False
+    assert entities['firmware_limit_estimated'].is_on is None
+    climate.extra_state_attributes.update({'external_temp_valid': False, 'firmware_fallback_active': True})
+    assert entities['external_temp_valid'].is_on is False
+    assert entities['firmware_fallback_active'].is_on is True
+    assert all(item._attr_entity_registry_enabled_default for item in entities.values())
+    assert all(fnmatchcase(f'binary_sensor.{item.suggested_object_id}',
+                          'binary_sensor.*tesy_diagnostic_*') for item in entities.values())
+    entry.options[const.CONF_SW_CONTROL_ENABLED] = False
+    assert all(not item.available for item in entities.values())
+
+
+def test_diagnostic_entities_do_not_make_device_or_external_sensor_requests():
+    device = types.SimpleNamespace(model='CN06AS', get_status=Mock())
+    climate = types.SimpleNamespace(convector=device, available=True, extra_state_attributes={})
+    entry = _DummyEntry(options={const.CONF_SW_CONTROL_ENABLED: True})
+    numeric = sensor.TesyControllerDiagnosticSensor(climate, entry, sensor.DIAGNOSTIC_SENSORS[0])
+    binary = binary_sensor.TesyControllerDiagnosticBinarySensor(climate, entry, 'external_temp_valid', 'Valid', 'mdi:thermometer')
+    for _ in range(3):
+        assert numeric.available
+        numeric.native_value
+        assert binary.available
+        binary.is_on
+    device.get_status.assert_not_called()

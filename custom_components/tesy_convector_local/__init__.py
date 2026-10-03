@@ -12,7 +12,7 @@ from .const import (
 )
 from .tesy_convector import TesyConvector
 
-_PLATFORMS = ["climate", "number", "binary_sensor"]
+_PLATFORMS = ["climate", "number", "binary_sensor", "sensor"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -31,7 +31,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await device.set_temperature_correction(correction)
 
     hass.data[DOMAIN][entry.entry_id] = {"device": device}
-    await hass.config_entries.async_forward_entry_setups(entry, _PLATFORMS)
+    # Diagnostic entities depend on the climate instance. HA may set up the
+    # platforms in a single batch concurrently, so establish climate first.
+    await hass.config_entries.async_forward_entry_setups(entry, ["climate"])
+    await hass.config_entries.async_forward_entry_setups(entry, _PLATFORMS[1:])
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
 

@@ -45,6 +45,45 @@ Software ON retains `ceil(target)` as the device thermostat safety limit;
 software OFF uses the supported minimum setpoint of 10 °C to preserve the device
 connection without the firmware continuing to heat a normally warm room.
 
+These values are also exposed as enabled-by-default diagnostic entities on the
+heater's device page. Sensors include Controller state, Requested duty cycle,
+Room temperature error, Internal temperature, Filtered external temperature,
+Predicted temperature, Effective OFF threshold, and Learned overshoot correction.
+Binary sensors show External temperature valid, Firmware fallback active,
+Software heating requested, and Firmware limiting estimated.
+
+After installing a version with the diagnostic entities, restart Home Assistant
+and open Settings → Devices & services → Tesy → your heater → Diagnostic.
+Numeric diagnostics and controller flags are available when software control is
+enabled. Controller state remains visible as `SW_DISABLED` when it is disabled;
+duty cycle is unknown until a complete cycle has been measured or restored.
+Diagnostic entities only read cached values and do not add device requests.
+They do not generate long-term statistics. Their duplicated diagnostic attributes
+are excluded from climate history; normal climate temperature and mode history
+remain available. Learned controller data still persists independently of Recorder.
+
+To keep the diagnostic entities themselves out of History, merge this into your
+Home Assistant `configuration.yaml` and restart Home Assistant:
+
+```yaml
+recorder:
+  exclude:
+    entity_globs:
+      - "sensor.*tesy_diagnostic_*"
+      - "binary_sensor.*tesy_diagnostic_*"
+```
+
+Merge these filters into an existing `recorder` section rather than creating a
+second one. Newly registered diagnostic entities use this naming pattern.
+Existing or manually renamed diagnostic entities retain their registry IDs:
+add those exact IDs under `recorder.exclude.entities` instead, or rename them to
+match the pattern. Explicit Recorder include rules can override the exclusion;
+check your existing filters. This prevents new recordings and does not delete
+existing history. The diagnostics remain available live on the device page.
+Home Assistant controls whole-entity recording through
+[Recorder filters](https://www.home-assistant.io/integrations/recorder/#configure-filter);
+the Diagnostic entity category alone does not exclude an entity from History.
+
 `sw_heat_requested` and `duty_cycle_pct` describe commanded phases, not measured
 element activity or electricity use. `internal_temp`, `raw_external_temp`,
 `external_temperature_error`, and `firmware_limit_estimated` help distinguish room
@@ -56,6 +95,18 @@ results, limitations, and how to compare software control with firmware in a roo
 
 ## Tested with:
 - Tesy Convector CN06AS
+
+## Integration icons
+
+TESY brand images are bundled in `custom_components/tesy_convector_local/brand/`,
+including normal and high-resolution icons and logos. Home Assistant 2026.3 or
+newer loads these local brand images. Older versions use the central Home
+Assistant brands service instead; manifest image-path fields do not enable local
+branding. After installing the updated integration, restart Home Assistant and
+refresh the browser if the previous icon is cached.
+
+The transparent TESY artwork is reused from the
+[Neo2SHYAlien fork](https://github.com/Neo2SHYAlien/TesyConvectorLocal/tree/79d81e4b/custom_components/tesy_convector_local/brand).
 
 ## Installation
 

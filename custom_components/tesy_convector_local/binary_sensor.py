@@ -1,13 +1,25 @@
 """Expose Window Open status as a binary sensor for Tesy Convector Local integration."""
 
+from datetime import timedelta
+
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.const import EntityCategory
 from homeassistant.helpers.entity import DeviceInfo
 
-from .const import DOMAIN
+from .const import CONF_SW_CONTROL_ENABLED, DOMAIN
+
+SCAN_INTERVAL = timedelta(seconds=10)
+
+DIAGNOSTIC_BINARY_SENSORS = (
+    ("external_temp_valid", "External temperature valid", "mdi:thermometer-check"),
+    ("firmware_fallback_active", "Firmware fallback active", "mdi:shield-check"),
+    ("sw_heat_requested", "Software heating requested", "mdi:radiator"),
+    ("firmware_limit_estimated", "Firmware limiting estimated", "mdi:thermometer-alert"),
+)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities):
@@ -16,7 +28,7 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities):
     # BEFORE async_add_entities is called, so this lookup is safe.
     climate_entity = hass.data[DOMAIN][entry.entry_id].get("climate_entity")
     if climate_entity is None:
-        # Should not happen if platform order is [climate, number, binary_sensor],
+        # Integration setup establishes climate before the other platforms,
         # but guard defensively. Cannot raise ConfigEntryNotReady from a platform
         # setup — HA won't retry it. Log and bail instead.
         import logging
@@ -27,7 +39,13 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities):
         )
         return
 
-    async_add_entities([WindowOpenBinarySensor(climate_entity, entry)])
+    async_add_entities([
+        WindowOpenBinarySensor(climate_entity, entry),
+        *[
+            TesyControllerDiagnosticBinarySensor(climate_entity, entry, key, name, icon)
+            for key, name, icon in DIAGNOSTIC_BINARY_SENSORS
+        ],
+    ])
 
 
 class WindowOpenBinarySensor(BinarySensorEntity):
@@ -61,3 +79,36 @@ class WindowOpenBinarySensor(BinarySensorEntity):
     def available(self) -> bool:
         """Mirror availability of the parent climate entity."""
         return getattr(self._climate, "available", True)
+
+
+class TesyControllerDiagnosticBinarySensor(BinarySensorEntity):
+    """Read controller flags from memory without querying the device."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = True
+
+    def __init__(self, climate, entry, key, name, icon):
+        self._climate = climate
+        self._entry = entry
+        self._key = key
+        self._attr_name = name
+        self._attr_icon = icon
+        self._attr_unique_id = f"{entry.entry_id}_diagnostic_{key}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            manufacturer="Tesy", model=climate.convector.model,
+        )
+
+    @property
+    def suggested_object_id(self):
+        """Give Recorder filters a stable diagnostic-only naming pattern."""
+        return f"tesy_diagnostic_{self._entry.entry_id}_{self._key}"
+
+    @property
+    def available(self):
+        return self._climate.available and self._entry.options.get(CONF_SW_CONTROL_ENABLED, False)
+
+    @property
+    def is_on(self):
+        return self._climate.extra_state_attributes.get(self._key)

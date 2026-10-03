@@ -5,7 +5,7 @@ DOMAIN = "tesy_convector_local"
 # FIX: binary_sensor was missing — must match _PLATFORMS in __init__.py.
 # PLATFORMS is kept here for reference but __init__.py uses its own _PLATFORMS list
 # as the authoritative source to avoid drift.
-PLATFORMS = ["climate", "number", "binary_sensor"]
+PLATFORMS = ["climate", "number", "binary_sensor", "sensor"]
 
 CONF_TEMP_FALL_RATE = "temp_fall_rate"
 CONF_TEMP_RECOVERY_RATE = "temp_recovery_rate"

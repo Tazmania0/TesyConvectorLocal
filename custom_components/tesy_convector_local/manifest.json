@@ -9,7 +9,5 @@
   "config_flow": true,
   "integration_type": "device",
   "iot_class": "local_polling",
-  "supported_platforms": ["climate", "number", "binary_sensor"],
-  "icon": "custom_components/tesy_convector_local/icon.png",
-  "logo": "custom_components/tesy_convector_local/icon.png"
+  "supported_platforms": ["climate", "number", "binary_sensor", "sensor"]
 }

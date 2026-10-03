@@ -1,0 +1,7 @@
+{
+  "services": {
+    "set_opened_window": {
+      "service": "mdi:window-open"
+    }
+  }
+}

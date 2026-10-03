@@ -63,7 +63,7 @@ sys.modules.setdefault('homeassistant.components.climate', types.SimpleNamespace
 sys.modules.setdefault('homeassistant.components.climate.const', types.SimpleNamespace(
     HVACMode=HVACMode, HVACAction=HVACAction, ClimateEntityFeature=ClimateEntityFeature,
 ))
-sys.modules.setdefault('homeassistant.const', types.SimpleNamespace(UnitOfTemperature=types.SimpleNamespace(CELSIUS='°C')))
+sys.modules.setdefault('homeassistant.const', types.SimpleNamespace(UnitOfTemperature=types.SimpleNamespace(CELSIUS='°C'), EntityCategory=types.SimpleNamespace(DIAGNOSTIC='diagnostic')))
 sys.modules.setdefault('homeassistant.helpers', types.ModuleType('homeassistant.helpers'))
 sys.modules.setdefault('homeassistant.helpers.config_validation', types.SimpleNamespace(entity_id=str))
 sys.modules.setdefault('homeassistant.helpers.entity', types.SimpleNamespace(DeviceInfo=dict))
@@ -752,3 +752,16 @@ def test_poll_does_not_treat_minimum_off_target_as_user_setpoint_change(entity):
     assert entity._sw_device_on is False
     assert entity.convector.setpoint == 10
     assert entity.target_temperature == 22.5
+
+
+def test_live_diagnostics_are_excluded_from_climate_recorded_attributes(entity):
+    poll(entity, 21.6)
+    entity._sw_duty_pct = 50
+    entity._sw_duty_cycles.append((120, 120))
+    attrs = entity.extra_state_attributes
+    assert attrs['duty_cycle_pct'] == 50
+    assert attrs['duty_cycles_sampled'] == 1
+    assert set(attrs) <= entity._unrecorded_attributes
+    assert {'temperature', 'current_temperature', 'hvac_action'}.isdisjoint(
+        entity._unrecorded_attributes
+    )

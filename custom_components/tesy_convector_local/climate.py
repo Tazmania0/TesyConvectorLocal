@@ -97,6 +97,17 @@ def _create_window_service_handler(hass: HomeAssistant):
 class TesyConvectorClimate(ClimateEntity):
     """Representation of a Tesy Convector as a ClimateEntity."""
 
+    # Keep the normal climate history, but omit live diagnostic payloads.
+    # Controller learning is persisted separately through Store.
+    _unrecorded_attributes = frozenset({
+        "sw_control_state", "external_temp_valid", "external_temp_age_sec",
+        "filtered_external_temp", "raw_external_temp", "internal_temp",
+        "external_temperature_error", "sw_heat_requested", "firmware_limit_estimated",
+        "firmware_fallback_active", "overshoot_correction", "i_correction",
+        "ramp_rate_c_per_min", "predicted_temp", "effective_off_threshold",
+        "duty_cycle_pct", "duty_cycles_sampled",
+    })
+
     def __init__(self, convector: TesyConvector, config_entry) -> None:
         super().__init__()
         self._device = convector
@@ -105,6 +116,7 @@ class TesyConvectorClimate(ClimateEntity):
         self._remove_update_listener = None
 
         self._attr_name = f"Tesy Convector {convector.model} ({convector.ip_address})"
+        self._attr_icon = "mdi:radiator"
         self._attr_temperature_unit = UnitOfTemperature.CELSIUS
         self._attr_supported_features = (
             ClimateEntityFeature.TARGET_TEMPERATURE

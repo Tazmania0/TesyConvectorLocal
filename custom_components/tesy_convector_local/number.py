@@ -20,6 +20,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
 class TesyTemperatureCorrectionNumber(NumberEntity):
     """Number entity for Tesy Convector temperature correction."""
 
+    _attr_icon = "mdi:thermometer"
+
     def __init__(self, device, config_entry) -> None:
         """Initialize the temperature correction number entity."""
         self._device = device
