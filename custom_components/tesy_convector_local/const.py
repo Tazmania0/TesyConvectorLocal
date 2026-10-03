@@ -34,6 +34,7 @@ DEFAULT_SW_HYSTERESIS = 0.3         # °C dead-band around setpoint
 DEFAULT_SW_LAG_TIME = 6.0           # minutes thermal lag (sensor + distance)
 DEFAULT_SW_EMA_ALPHA = 0.2          # EMA factor: 0.2 = heavy smooth, 1.0 = raw
 DEFAULT_SW_I_GAIN = 0.5              # integral gain: fraction of avg error applied
+EXTERNAL_TEMP_MAX_AGE_SEC = 180     # reject frozen external feedback
 SW_I_WINDOW_SEC   = 1800             # seconds of history for integral average (30 min)
 
 DEFAULT_TEMP_FALL_RATE = 0.5       # °C/min

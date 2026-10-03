@@ -15,6 +15,28 @@ This custom integration allows you to control your Tesy Convector directly from 
     * Customizable hysteresis delay to avoid toggling
     * Binary_sensor for window open status
 
+## External-temperature software control
+
+In HEAT mode, software control uses one validated, EMA-filtered external sensor
+sample per poll. The ON threshold is target minus hysteresis; predictive cutoff
+and learned post-OFF coast peaks reduce repeatable overshoot. The learned
+correction is bounded and decays on cycles without overshoot. Minimum ON/OFF
+durations protect normal switching, while sensor failure transfers control
+immediately to the device thermostat.
+
+Missing, invalid, out-of-range, or more than 180-second-old sensor reports trigger
+firmware fallback. Freshness uses Home Assistant's `last_reported` timestamp,
+or `last_updated` on older versions. The firmware receives the floored user
+target (22.5 °C becomes 22 °C), including after restart. Recovery starts with
+fresh controller history. Sensors must report at least every three minutes,
+even when their temperature has not changed.
+
+Entity attributes expose sensor validity and age, filtered temperature,
+controller state, firmware fallback, prediction, effective cutoff, learned
+overshoot correction, slow average correction, and completed-cycle duty.
+Software ON retains `ceil(target)` as the device thermostat safety limit;
+software OFF lowers the setpoint to preserve the device connection.
+
 ## Tested with:
 - Tesy Convector CN06AS
 

@@ -1,25 +1,8 @@
-"""Climate platform for Tesy Convector Local integration — v0.3.
-
-Changes vs v0.2:
-- Half-degree (0.5 °C) target temperature steps.
-- Software on/off controller (CONF_SW_CONTROL_ENABLED):
-    * Reads current temperature from the external sensor (required when sw control is on).
-    * Implements a bang-bang controller with a configurable dead-band / hysteresis.
-    * Enforces minimum ON and minimum OFF phase durations (default 60 s each) to
-      reduce wear on the heating element's control relay.
-    * When sw control is active the integration drives the device on/off itself;
-      the device's own thermostat is bypassed (setTemp is set to max so the device
-      always heats when turned on).
-    * SW control is suspended during window-open events (device is already forced OFF).
-- Window detection logic unchanged from v0.2 but now also works correctly when
-  sw_control_enabled=True (external sensor is required for both features anyway).
-
-Fixes carried forward from v0.2 (see original header for full list).
-"""
+"""Climate platform with adaptive external-temperature heating control."""
 
 import asyncio
 import math
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from statistics import mean
 
@@ -61,16 +44,13 @@ from .const import (
     DEFAULT_TEMP_RECOVERY_ABS,
     DEFAULT_TEMP_RECOVERY_RATE,
     DOMAIN,
+    EXTERNAL_TEMP_MAX_AGE_SEC,
     WINDOW_OPEN_TIMEOUT_SEC,
     WINDOW_RECOVERY_HYSTERESIS_SEC,
 )
 from .tesy_convector import TesyConvector
 
 _LOGGER = logging.getLogger(__name__)
-
-# Temperature sent to device when sw-control drives it ON so the device's own
-# thermostat does not cut it off prematurely.
-_SW_CONTROL_MAX_SETTEMP = 30
 
 SET_OPENED_WINDOW_SCHEMA = vol.Schema(
     {
@@ -160,7 +140,16 @@ class TesyConvectorClimate(ClimateEntity):
         self._manual_window_override: bool = False
 
         # External sensor availability tracking
-        self._ext_sensor_unavailable_logged: bool = False
+        self._external_temp_age_sec: float | None = None
+        self._external_temp_valid = False
+        self._external_temp_reason = "missing sensor"
+        self._external_sensor_entity: str | None = None
+        self._sw_fallback_active = False
+        self._sw_was_enabled = False
+        self._sw_ramp_rate: float | None = None
+        self._sw_predicted_temp: float | None = None
+        self._sw_effective_off_threshold: float | None = None
+        self._sw_i_correction: float | None = None
 
         # Boot inhibit: window detection is suppressed until enough temperature
         # history has accumulated to make the trend estimate reliable.
@@ -306,7 +295,8 @@ class TesyConvectorClimate(ClimateEntity):
                 self._hvac_mode = HVACMode.HEAT
                 self._sw_device_on = None  # force re-evaluation
                 self._update_hvac_action()
-                _LOGGER.debug("Boot: restored HEAT+sw-control — deferring ON/OFF to first poll")
+                _LOGGER.debug("Boot: restored HEAT+sw-control — evaluating immediately")
+                await self.async_update()
             else:
                 self._hvac_mode = restored_mode
                 await self.async_set_hvac_mode(restored_mode)
@@ -383,6 +373,13 @@ class TesyConvectorClimate(ClimateEntity):
             # is NOT active.  When sw-control is active, _hvac_mode is owned
             # by HA and must only change through explicit user actions.
             device_on = status["payload"]["onOff"]["payload"]["status"] == "on"
+            if self._sw_was_enabled and not sw_control:
+                if self._target_temp is not None:
+                    await self._set_firmware_target()
+                    status["payload"]["setTemp"]["payload"]["temp"] = math.floor(self._target_temp)
+                self._reset_sw_controller()
+                self._sw_fallback_active = False
+            self._sw_was_enabled = sw_control
 
             if not sw_control:
                 if device_on:
@@ -407,7 +404,10 @@ class TesyConvectorClimate(ClimateEntity):
             # device_on is always True in sw-control OFF phase (setpoint=floor-1)
             # so skip the device_on check — _update_hvac_action uses _sw_device_on.
             if sw_control and self._hvac_mode == HVACMode.HEAT:
-                pass
+                internal_temp = self._extract_internal_temp(status)
+                self._device_is_heating = device_on and (
+                    internal_temp is None or internal_temp < status["payload"]["setTemp"]["payload"]["temp"]
+                )
             elif not device_on:
                 self._device_is_heating = False
             elif self._hvac_mode == HVACMode.AUTO or (
@@ -450,7 +450,9 @@ class TesyConvectorClimate(ClimateEntity):
             # -- External change detection (sw-control only) ------------------
             # Device is not a slave — keyboard or manufacturer app can change
             # mode and setpoint at any time. Read actual state and adapt.
-            if sw_control and self._hvac_mode == HVACMode.HEAT and not self._window_opened:
+            if sw_control and self._hvac_mode == HVACMode.HEAT and not self._window_opened and (
+                self._sw_device_on is not None or self._sw_fallback_active
+            ):
                 device_mode = status["payload"]["setMode"]["payload"]["name"]
                 device_setpoint = status["payload"]["setTemp"]["payload"]["temp"]
 
@@ -460,7 +462,9 @@ class TesyConvectorClimate(ClimateEntity):
                         "SW ctrl: device turned OFF externally — stopping controller"
                     )
                     self._hvac_mode = HVACMode.OFF
-                    self._sw_device_on = None
+                    await self._set_firmware_target()
+                    self._reset_sw_controller()
+                    self._sw_fallback_active = False
                     self._update_hvac_action()
                     self.async_write_ha_state()
                 elif device_mode == "program":
@@ -468,7 +472,10 @@ class TesyConvectorClimate(ClimateEntity):
                         "SW ctrl: device switched to AUTO externally — stopping controller"
                     )
                     self._hvac_mode = HVACMode.AUTO
-                    self._sw_device_on = None
+                    # Program mode has already installed its schedule target;
+                    # do not overwrite that with the cached HEAT setpoint.
+                    self._reset_sw_controller()
+                    self._sw_fallback_active = False
                     self._update_hvac_action()
                     self.async_write_ha_state()
                 else:
@@ -478,7 +485,7 @@ class TesyConvectorClimate(ClimateEntity):
                     if self._target_temp is not None:
                         sw_on_sp = math.ceil(self._target_temp)
                         sw_off_sp = math.floor(self._target_temp) - 1
-                        is_sw_setpoint = device_setpoint in (sw_on_sp, sw_off_sp)
+                        is_sw_setpoint = device_setpoint in (sw_on_sp, sw_off_sp, math.floor(self._target_temp))
                     else:
                         is_sw_setpoint = False
                     if not is_sw_setpoint and device_setpoint != self._target_temp:
@@ -488,31 +495,44 @@ class TesyConvectorClimate(ClimateEntity):
                         )
                         self._target_temp = float(device_setpoint)
                         self._persist_setpoint(float(device_setpoint))
-                        self._sw_device_on = None  # re-evaluate on next poll
+                        self._reset_sw_controller()
+                        self._sw_fallback_active = False
                         self.async_write_ha_state()
+
+            external_temp = self._get_external_temp(temperature_entity, sw_ema_alpha)
+            self._current_temp = (
+                external_temp if external_temp is not None else self._extract_internal_temp(status)
+            )
+            if external_temp is None:
+                self._temp_history = []
+                self._window_detection_ready = False
+                # Sensor failure must not leave an automatically or manually
+                # inhibited heater stuck OFF. Health handling owns failover.
+                if use_external_temp and self._window_opened:
+                    await self._close_window(now_mono)
+
+            if sw_control and self._hvac_mode == HVACMode.HEAT and external_temp is None:
+                await self._enter_firmware_fallback(self._external_temp_reason)
 
             await self._handle_window_detection(
                 window_open_enabled=window_open_enabled,
                 temp_fall_rate=temp_fall_rate,
                 temp_recovery_rate=temp_recovery_rate,
                 temp_recovery_abs=temp_recovery_abs,
-                use_external_temp=use_external_temp,
-                temperature_entity=temperature_entity,
-                status=status,
+                current_temp=external_temp,
             )
 
-            # v0.3: run sw-controller after temperature is updated,
-            # suspended while window is open (device already forced OFF)
-            if sw_control and not self._window_opened:
-                await self._run_sw_controller(
-                    temperature_entity=temperature_entity,
-                    min_on_sec=sw_min_on,
-                    min_off_sec=sw_min_off,
-                    hysteresis=sw_hysteresis,
-                    lag_time_min=sw_lag_time,
-                    i_gain=sw_i_gain,
-                    ema_alpha=sw_ema_alpha,
-                )
+            if sw_control and self._hvac_mode == HVACMode.HEAT and not self._window_opened:
+                if external_temp is not None:
+                    self._leave_firmware_fallback_if_needed()
+                    await self._run_sw_controller(
+                        current_temp=external_temp,
+                        min_on_sec=sw_min_on,
+                        min_off_sec=sw_min_off,
+                        hysteresis=sw_hysteresis,
+                        lag_time_min=sw_lag_time,
+                        i_gain=sw_i_gain,
+                    )
             self._update_hvac_action()
         else:
             if "error" in status:
@@ -527,7 +547,8 @@ class TesyConvectorClimate(ClimateEntity):
                     # Mark entity unavailable — blocks automations and commands.
                     self._attr_available = False
                     # Unknown device state — reset sw-controller.
-                    self._sw_device_on = None
+                    self._reset_sw_controller()
+                    self._sw_fallback_active = False
                     self._update_hvac_action()
                     self.async_write_ha_state()
                 else:
@@ -546,330 +567,200 @@ class TesyConvectorClimate(ClimateEntity):
     # v0.3 — Software on/off controller
     # ------------------------------------------------------------------
 
+    def _reset_sw_controller(self) -> None:
+        """Discard history whenever another controller may have driven the heater."""
+        self._sw_device_on = None
+        self._sw_temp_history = []
+        self._sw_long_history = []
+        self._sw_last_on_time = None
+        self._sw_last_off_time = None
+        self._sw_peak_temp = None
+        self._sw_overshoot_correction = 0.0
+        self._sw_duty_cycles = []
+        self._sw_duty_pct = None
+        self._sw_ramp_rate = None
+        self._sw_predicted_temp = None
+        self._sw_effective_off_threshold = None
+        self._sw_i_correction = None
+
+    async def _set_firmware_target(self) -> None:
+        """Restore the integer firmware target, preferring slight undershoot."""
+        if self._target_temp is not None:
+            result = await self.convector.set_temperature(math.floor(self._target_temp))
+            if isinstance(result, dict) and "error" in result:
+                raise RuntimeError(f"Could not restore firmware target: {result['error']}")
+
+    async def _enter_firmware_fallback(self, reason: str) -> None:
+        """Transfer ownership once, including when SW state is unknown at boot."""
+        if self._sw_fallback_active or self._target_temp is None:
+            return
+        # Set the safety target before enabling heating. Failed writes must
+        # remain retryable rather than claiming that fallback was applied.
+        await self._set_firmware_target()
+        result = await self.convector.set_mode("heating")
+        if isinstance(result, dict) and "error" in result:
+            raise RuntimeError(f"Could not enable firmware heating: {result['error']}")
+        self._reset_sw_controller()
+        self._sw_fallback_active = True
+        if self._current_temp is not None:
+            self._device_is_heating = self._current_temp < math.floor(self._target_temp)
+        _LOGGER.warning("SW controller: external sensor %s, entering firmware fallback", reason)
+
+    def _leave_firmware_fallback_if_needed(self) -> None:
+        if self._sw_fallback_active:
+            self._reset_sw_controller()
+            self._sw_fallback_active = False
+            _LOGGER.info("SW controller: external sensor recovered, resuming software control")
+
+    def _learn_coast_peak(self, hysteresis: float) -> None:
+        """Learn once per completed coast, with slow updates and reversible bias."""
+        if self._sw_peak_temp is None:
+            return
+        error = self._sw_peak_temp - self._target_temp
+        if error > 0.02:
+            correction = self._sw_overshoot_correction + 0.3 * error
+        else:
+            # No overshoot: ease the early cutoff as room conditions change.
+            correction = self._sw_overshoot_correction * 0.8
+        self._sw_overshoot_correction = max(0.0, min(hysteresis, correction))
+        _LOGGER.info(
+            "SW ctrl learned overshoot: peak=%.2f target=%.2f correction=%.3f",
+            self._sw_peak_temp, self._target_temp, self._sw_overshoot_correction,
+        )
+        self._sw_peak_temp = None
+
     async def _run_sw_controller(
         self,
-        temperature_entity: str | None,
+        current_temp: float,
         min_on_sec: float,
         min_off_sec: float,
         hysteresis: float,
         lag_time_min: float,
         i_gain: float,
-        ema_alpha: float = 0.3,
     ) -> None:
-        """Bang-bang controller with predictive cutoff and integral drift correction.
-
-        Core thresholds
-        ---------------
-          lower = setpoint - hysteresis     -> turn ON  at or below this
-          upper = setpoint                    -> turn OFF at or above this (= setpoint)
-
-        Predictive early-OFF (during ON phase)
-        ---------------------------------------
-        Measures the current rising ramp rate (deg C/min) from recent history
-        and projects forward by lag_time_min minutes. If the predicted temp
-        will exceed upper, the heater turns off early to compensate for
-        thermal lag between the heater and the distant sensor.
-
-          predicted = current + ramp_rate x lag_time_min
-          if predicted >= upper  ->  turn OFF early
-
-        Integral drift correction (I-term)
-        -----------------------------------
-        A slow steady overshoot (e.g. 0.1 deg C / 10 min while device is OFF)
-        is caused by heat diffusing from warm surfaces to the sensor long after
-        the heater stops. The ramp during OFF is nearly flat so the predictive
-        cutoff cannot help.
-
-        The I-term tracks the average temperature error over the last
-        SW_I_WINDOW_SEC (30 min) and shifts both thresholds down by
-        (avg_error x i_gain), capped at +/- hysteresis to prevent runaway.
-
-          avg_error    = mean(readings over window) - setpoint
-          i_correction = avg_error x i_gain   [capped at +/-hysteresis]
-          effective_upper = upper - i_correction
-
-        The lower threshold is intentionally NOT shifted. Undershooting
-        costs nothing (room is just slightly cool for a few minutes).
-        Overshooting costs money (paid for heat above the setpoint).
-        Asymmetric correction maximises efficiency.
-
-        With a 0.6 deg C systematic overshoot and i_gain=0.5:
-          i_correction = 0.3 deg C
-          effective_upper shifts 0.3 deg C lower
-          heater turns OFF earlier, average temp converges to setpoint.
-
-        i_gain=0  -> integral correction disabled.
-        i_gain=1  -> full average error applied as correction.
-        """
-        if self._hvac_mode not in (HVACMode.HEAT,):
+        """Adaptive hysteresis, cycle prediction, then slow steady-state bias."""
+        if self._hvac_mode != HVACMode.HEAT or self._target_temp is None:
             return
-
-        if self._target_temp is None:
-            return
-
-        current_temp = self._get_external_temp(temperature_entity, ema_alpha=ema_alpha)
-        if current_temp is None:
-            _LOGGER.debug("SW controller: no current temperature -- skipping")
-            return
-
         now = self.hass.loop.time()
-
-        # -- History maintenance -----------------------------------------------
-        # Short history: clears on ON/OFF transitions -- used for ramp rate only
         self._sw_temp_history.append((now, current_temp))
-        self._sw_temp_history = [
-            (t, v) for t, v in self._sw_temp_history if now - t <= 600
-        ]
-        # Long history: never cleared on transitions -- used for integral average
+        self._sw_temp_history = [(t, v) for t, v in self._sw_temp_history if now - t <= 600]
         self._sw_long_history.append((now, current_temp))
-        self._sw_long_history = [
-            (t, v) for t, v in self._sw_long_history if now - t <= SW_I_WINDOW_SEC
-        ]
+        self._sw_long_history = [(t, v) for t, v in self._sw_long_history if now - t <= SW_I_WINDOW_SEC]
+        if self._sw_device_on is False and self._sw_peak_temp is not None:
+            self._sw_peak_temp = max(self._sw_peak_temp, current_temp)
 
         setpoint = self._target_temp
-        # Dead-band is entirely below setpoint.
-        # Setpoint is the upper boundary — never intentionally heat above it.
-        # hysteresis = how far below setpoint the room must drop before firing.
-        #
-        #   lower = setpoint - hysteresis   -> ON  at or below this
-        #   upper = setpoint                -> OFF at or above this
-        #
-        # Example: setpoint=22.0, hysteresis=0.2
-        #   ON  at or below 21.8 C
-        #   OFF at or above 22.0 C
-        upper = setpoint
         lower = setpoint - hysteresis
-
-        # -- Integral correction -----------------------------------------------
         i_correction = 0.0
-        if i_gain > 0 and len(self._sw_long_history) >= 6:
-            # Need at least 6 readings (~1 min) before trusting the average
-            avg_temp = sum(v for _, v in self._sw_long_history) / len(self._sw_long_history)
-            avg_error = avg_temp - setpoint   # positive = running hot
-            raw_correction = avg_error * i_gain
-            # Cap at +/-hysteresis to prevent runaway
-            i_correction = max(-hysteresis, min(hysteresis, raw_correction))
-            if abs(i_correction) > 0.01:
-                _LOGGER.debug(
-                    "SW ctrl I-term: avg=%.2f C  error=%.3f C  correction=%.3f C  "
-                    "(gain=%.1f  n=%d readings)",
-                    avg_temp, avg_error, i_correction, i_gain, len(self._sw_long_history),
-                )
-
-        # Asymmetric: only upper shifts. Lower is left at nominal.
-        # Undershoot costs nothing; overshoot costs money.
-        effective_upper = upper - i_correction
-        # effective_lower is just lower — no shift needed
-
-        # -- Ramp rate (predictive early-OFF while ON) -------------------------
+        # The I-term needs a substantial window, not just six startup polls.
+        # It only reduces the cutoff; a cool mean never authorizes heating
+        # above target. Reserve headroom for cycle-level overshoot learning.
+        if i_gain > 0 and now - self._sw_long_history[0][0] >= SW_I_WINDOW_SEC / 2:
+            avg_error = mean(v for _, v in self._sw_long_history) - setpoint
+            i_correction = max(0.0, min(hysteresis * 0.25, avg_error * i_gain))
+        self._sw_overshoot_correction = min(hysteresis, self._sw_overshoot_correction)
+        # Leave a useful band between ON and OFF even at maximum adaptation.
+        combined = min(hysteresis * 0.8, self._sw_overshoot_correction + i_correction)
+        effective_upper = setpoint - combined
         ramp_rate = 0.0
         if self._sw_device_on:
-            # Use a short min_span_sec (20 s = 2 polls) for the sw-controller
-            # ramp estimator. _sw_temp_history is cleared on every ON/OFF
-            # transition so it is always clean — no risk of stale boot noise.
-            # The default 60 s used by window detection is too long here and
-            # makes the predictive cutoff blind for the first 6 polls of every
-            # ON phase, exactly when the ramp matters most.
-            ramp_rate = self.estimate_temp_trend(self._sw_temp_history, min_span_sec=20.0) or 0.0
-            ramp_rate = max(0.0, ramp_rate)   # only rising ramp is relevant
-
-        # -- Desired state -----------------------------------------------------
-        #
-        # Upper cutoff logic (while ON):
-        #   1. current_temp >= setpoint          — at or above target: always OFF
-        #                                           hysteresis does NOT apply here;
-        #                                           heating above setpoint costs money
-        #   2. predicted_temp >= effective_upper — predictive early-OFF for lag
-        #   3. current_temp >= effective_upper   — standard threshold (fallback)
-        #
-        # Lower cutoff logic (while OFF):
-        #   current_temp <= lower                — full hysteresis dead-band applies;
-        #                                           undershoot costs nothing
-        if self._sw_device_on is None:
-            # First evaluation after boot/mode-switch — use the same lower
-            # threshold as the normal OFF→ON transition so we don't fire an
-            # unnecessary ON pulse when temperature is already within the
-            # dead-band (e.g. 21.8°C with setpoint 22.0°C, hysteresis 0.2°C
-            # → lower=21.9°C → correctly stays OFF).
-            desired_on = current_temp <= lower
-
-        elif self._sw_device_on:
-            # Rule 1: at or above effective_upper (setpoint - i_correction)
-            at_upper = current_temp >= effective_upper
-            # Rule 2: predictive — will coast reach effective_upper within lag window?
-            predicted_temp = current_temp + ramp_rate * lag_time_min
-            predicted_overshoot = predicted_temp >= effective_upper
-
-            if at_upper or predicted_overshoot:
-                desired_on = False
-                if predicted_overshoot and not at_upper:
-                    _LOGGER.debug(
-                        "SW ctrl: predictive early-OFF -- "
-                        "current=%.2f C ramp=%.3f C/min lag=%.1fmin "
-                        "-> predicted=%.2f C >= eff_upper=%.2f C (i_corr=%.3f C)",
-                        current_temp, ramp_rate, lag_time_min,
-                        predicted_temp, effective_upper, i_correction,
-                    )
-                else:
-                    _LOGGER.debug(
-                        "SW ctrl: OFF at upper=%.2f C -- current=%.2f C  i_corr=%.3f C",
-                        effective_upper, current_temp, i_correction,
-                    )
-            else:
-                desired_on = True
-
-        else:
-            desired_on = current_temp <= lower
-
-        # -- Minimum phase guards ----------------------------------------------
-        if desired_on and not self._sw_device_on:
-            if self._sw_last_off_time is not None:
-                elapsed = now - self._sw_last_off_time
-                if elapsed < min_off_sec:
-                    _LOGGER.debug(
-                        "SW ctrl: ON suppressed -- min OFF not met (%.0f/%.0f s)",
-                        elapsed, min_off_sec,
-                    )
-                    return
-
-        if not desired_on and self._sw_device_on:
-            if self._sw_last_on_time is not None:
-                elapsed = now - self._sw_last_on_time
-                if elapsed < min_on_sec:
-                    _LOGGER.debug(
-                        "SW ctrl: OFF suppressed -- min ON not met (%.0f/%.0f s)",
-                        elapsed, min_on_sec,
-                    )
-                    return
-
-        # -- Transitions -------------------------------------------------------
-        # Handle None→OFF: first poll after mode switch with temp above setpoint.
-        # Neither normal branch fires (None is falsy for ON, not truthy for OFF).
-        # Explicitly set floor-1 so device display matches expected idle state.
-        if not desired_on and self._sw_device_on is None:
-            sw_off_setpoint = math.floor(setpoint) - 1
-            _LOGGER.debug(
-                "SW ctrl: init idle — temp %.2f C above setpoint %.1f C, "
-                "setting floor setpoint %d C",
-                current_temp, setpoint, sw_off_setpoint,
-            )
-            await self.convector.set_temperature(sw_off_setpoint)
-            self._sw_device_on = False
-            self._update_hvac_action()
-            self.async_write_ha_state()
+            ramp_rate = max(0.0, self.estimate_temp_trend(self._sw_temp_history, min_span_sec=20.0) or 0.0)
+        predicted_temp = current_temp + ramp_rate * lag_time_min
+        self._sw_ramp_rate = ramp_rate
+        self._sw_predicted_temp = predicted_temp
+        self._sw_effective_off_threshold = effective_upper
+        self._sw_i_correction = i_correction
+        _LOGGER.debug(
+            "SW ctrl: temp=%.2f lower=%.2f ramp=%.3f predicted=%.2f cutoff=%.2f",
+            current_temp, lower, ramp_rate, predicted_temp, effective_upper,
+        )
+        desired_on = (
+            current_temp < effective_upper and predicted_temp < effective_upper
+            if self._sw_device_on else current_temp <= lower
+        )
+        if desired_on == self._sw_device_on:
             return
+        if desired_on and self._sw_last_off_time is not None:
+            if now - self._sw_last_off_time < min_off_sec:
+                return
+        if not desired_on and self._sw_device_on and self._sw_last_on_time is not None:
+            if now - self._sw_last_on_time < min_on_sec:
+                return
 
-        if desired_on and not self._sw_device_on:
-            _LOGGER.info(
-                "SW ctrl ON:  %.2f C <= %.2f C eff_lower  (set=%.1f C  i_corr=%.3f C)",
-                current_temp, lower, setpoint, i_correction,
-            )
-            # Safety setpoint must be strictly above current_temp so the
-            # device firmware fires immediately (device heats when temp < setpoint).
-            # With setpoint=floor-1 in the OFF phase, ceil(setpoint) alone can
-            # equal current_temp — device won't heat. Use max(ceil, ceil(current)+1)
-            # to guarantee heating fires while keeping safety cap reasonable.
-            # Device is already in heating mode (set once in async_set_hvac_mode).
-            # Just raise setpoint above current_temp — firmware heats immediately.
-            safety_setpoint = math.ceil(setpoint)
-            await self.convector.set_temperature(safety_setpoint)
-            await asyncio.sleep(0.1)
-            self._sw_device_on = True
-            self._sw_last_on_time = now
-            self._sw_temp_history = [(now, current_temp)]
-            # Complete the last cycle by filling in OFF duration
+        # Keep the TCP connection alive by lowering the thermostat for OFF;
+        # ceil(target) provides the firmware safety limiter for ON.
+        device_target = math.ceil(setpoint) if desired_on else math.floor(setpoint) - 1
+        result = await self.convector.set_temperature(device_target)
+        if isinstance(result, dict) and "error" in result:
+            raise RuntimeError(f"Could not apply SW phase: {result['error']}")
+        if self._sw_device_on is None:
+            result = await self.convector.set_mode("heating")
+            if isinstance(result, dict) and "error" in result:
+                raise RuntimeError(f"Could not enable SW heating mode: {result['error']}")
+        if desired_on:
+            self._learn_coast_peak(hysteresis)
             if self._sw_duty_cycles and self._sw_last_off_time is not None:
                 on_dur, _ = self._sw_duty_cycles[-1]
-                off_dur = now - self._sw_last_off_time
-                self._sw_duty_cycles[-1] = (on_dur, off_dur)
-                # Recompute average duty over complete cycles
+                self._sw_duty_cycles[-1] = (on_dur, now - self._sw_last_off_time)
                 complete = [(on, off) for on, off in self._sw_duty_cycles if off > 0]
                 if complete:
-                    self._sw_duty_pct = round(
-                        100 * sum(on / (on + off) for on, off in complete) / len(complete)
-                    )
-            self._update_hvac_action()
-            self.async_write_ha_state()  # immediate widget update
-
-        elif not desired_on and self._sw_device_on:
-            predicted_temp = current_temp + ramp_rate * lag_time_min
-            _LOGGER.info(
-                "SW ctrl OFF: %.2f C  ramp=%.3f C/min  predicted=%.2f C  "
-                "eff_upper=%.2f C  i_corr=%.3f C  (set=%.1f C)",
-                current_temp, ramp_rate, predicted_temp,
-                effective_upper, i_correction, setpoint,
-            )
-            # set_temperature(floor-1) instead of turn_off() —
-            # onOff=off resets the device TCP stack ('Connection reset by peer').
-            # floor(setpoint)-1 keeps device on but below any useful setpoint.
-            sw_off_setpoint = math.floor(setpoint) - 1
-            await self.convector.set_temperature(sw_off_setpoint)
-            await asyncio.sleep(0.1)
-            self._sw_device_on = False
+                    self._sw_duty_pct = round(100 * mean(on / (on + off) for on, off in complete))
+            self._sw_last_on_time = now
+        else:
             self._sw_last_off_time = now
-            self._sw_peak_temp = current_temp   # start tracking coast peak from now
-            self._sw_temp_history = []
-            # Store ON duration — OFF duration added when next ON fires
-            if self._sw_last_on_time is not None:
-                on_dur = now - self._sw_last_on_time
-                self._sw_duty_cycles.append((on_dur, 0.0))  # off_dur filled later
-                self._sw_duty_cycles = self._sw_duty_cycles[-5:]  # keep last 5
-            self._update_hvac_action()
-            self.async_write_ha_state()  # immediate widget update
-
-    async def _restore_firmware_control(self) -> None:
-        """Hand temperature control back to device firmware.
-
-        Called when the external sensor becomes unavailable while sw-control
-        is active.  Sends the user's desired setpoint (as a rounded integer)
-        back to the device so the built-in thermostat takes over cleanly.
-        """
-        _LOGGER.warning(
-            "SW controller: external sensor lost — restoring device firmware control "
-            "with setpoint %s°C",
-            self._target_temp,
+            if self._sw_device_on is True:
+                self._sw_peak_temp = current_temp
+                if self._sw_last_on_time is not None:
+                    self._sw_duty_cycles.append((now - self._sw_last_on_time, 0.0))
+                    self._sw_duty_cycles = self._sw_duty_cycles[-5:]
+        self._sw_device_on = desired_on
+        self._sw_temp_history = [(now, current_temp)]
+        _LOGGER.info(
+            "SW ctrl %s: temp=%.2f predicted=%.2f cutoff=%.2f",
+            "ON" if desired_on else "OFF", current_temp, predicted_temp, effective_upper,
         )
-        if self._target_temp is not None:
-            # Floor: better to be 0.5°C under target than over when falling back
-            device_setpoint = int(self._target_temp)  # floor for positive temps
-            await self.convector.set_temperature(device_setpoint)
-            await asyncio.sleep(0.1)
-        # Ensure device is ON in heating mode so firmware thermostat can operate
-        if self._hvac_mode == HVACMode.HEAT:
-            await self.convector.set_mode("heating")
-            await asyncio.sleep(0.1)
-        # Reset sw-controller state — it must re-evaluate when sensor returns
-        self._sw_device_on = None
+        self._update_hvac_action()
+        self.async_write_ha_state()
 
     def _get_external_temp(
         self,
         temperature_entity: str | None,
         ema_alpha: float = DEFAULT_SW_EMA_ALPHA,
     ) -> float | None:
-        """Return EMA-filtered external temperature.
-
-        filtered = alpha * raw + (1 - alpha) * previous
-        alpha=1.0 → raw passthrough.  alpha=0.2 → heavy smoothing.
-        First valid reading seeds the EMA with no initial lag.
-        Shares _ema_temp with window detection so all consumers
-        see the same noise-free signal.
-        """
-        if not temperature_entity:
+        """Acquire, validate freshness, and filter exactly once per poll."""
+        if temperature_entity != self._external_sensor_entity:
+            self._external_sensor_entity = temperature_entity
+            self._ema_temp = None
+            self._reset_sw_controller()
+            self._temp_history = []
+            self._window_detection_ready = False
+        self._external_temp_valid = False
+        self._external_temp_age_sec = None
+        self._external_temp_reason = "missing"
+        state = self.hass.states.get(temperature_entity) if temperature_entity else None
+        raw = None
+        if state is not None:
+            # last_reported includes unchanged numeric reports on modern HA.
+            reported = getattr(state, "last_reported", None) or getattr(state, "last_updated", None)
+            if reported is not None:
+                self._external_temp_age_sec = max(0.0, (datetime.now(timezone.utc) - reported).total_seconds())
+            try:
+                raw = float(state.state)
+            except (TypeError, ValueError):
+                self._external_temp_reason = "unavailable or invalid"
+            else:
+                if not math.isfinite(raw) or not -40.0 <= raw <= 80.0:
+                    self._external_temp_reason = "out of range"
+                    raw = None
+                elif self._external_temp_age_sec is None or self._external_temp_age_sec > EXTERNAL_TEMP_MAX_AGE_SEC:
+                    self._external_temp_reason = "stale"
+                    raw = None
+        if raw is None:
+            self._ema_temp = None
             return None
-        temp_state = self.hass.states.get(temperature_entity)
-        if temp_state is None or temp_state.state in ("unavailable", "unknown"):
-            return None
-        try:
-            raw = float(temp_state.state)
-            if not -40.0 <= raw <= 80.0:
-                return None
-        except ValueError:
-            return None
-
-        if self._ema_temp is None:
-            self._ema_temp = raw  # seed — no lag on first reading
-        else:
-            self._ema_temp = ema_alpha * raw + (1.0 - ema_alpha) * self._ema_temp
+        self._external_temp_valid = True
+        alpha = max(0.0, min(1.0, ema_alpha))
+        self._ema_temp = raw if self._ema_temp is None else alpha * raw + (1.0 - alpha) * self._ema_temp
         return self._ema_temp
 
     # ------------------------------------------------------------------
@@ -916,157 +807,78 @@ class TesyConvectorClimate(ClimateEntity):
         temp_fall_rate: float,
         temp_recovery_rate: float,
         temp_recovery_abs: float,
-        use_external_temp: bool,
-        temperature_entity: str | None,
-        status: dict,
-        ema_alpha: float = DEFAULT_SW_EMA_ALPHA,
+        current_temp: float | None,
     ) -> None:
-        """Update current temperature and run window open/close detection."""
-        if self._manual_window_override:
-            _LOGGER.debug("Window detection skipped: manual override active")
-            self._update_current_temp_from_entity_or_status(
-                temperature_entity, use_external_temp, status
+        """Consume the poll's validated sample for window detection only."""
+        if self._manual_window_override or current_temp is None or not window_open_enabled:
+            return
+        now = self.hass.loop.time()
+        self._temp_history.append((now, current_temp))
+        self._temp_history = [x for x in self._temp_history if now - x[0] <= 180]
+
+        trend = self.estimate_temp_trend(self._temp_history)
+
+        # Mark detection as ready once we have a valid trend estimate
+        # (i.e. enough history has accumulated since boot/restart).
+        if trend is not None and not self._window_detection_ready:
+            self._window_detection_ready = True
+            _LOGGER.info(
+                "Window detection: sufficient history accumulated — detection active"
+            )
+
+        if trend is None or not self._window_detection_ready:
+            return
+
+        # Check re-detection inhibit — user may have dismissed the
+        # window event while temperature was still falling.
+        if (
+            self._window_inhibit_until is not None
+            and now < self._window_inhibit_until
+        ):
+            remaining = self._window_inhibit_until - now
+            _LOGGER.debug(
+                "Window detection inhibited — %.0fs remaining", remaining
             )
             return
 
-        now = self.hass.loop.time()
+        if not self._window_opened and trend < -temp_fall_rate:
+            self._window_opened = True
+            self._prev_hvac_mode = self._hvac_mode
+            self._window_change_time = now
+            self._min_temp_during_open = current_temp
+            self._temp_history = []
+            self._window_detection_ready = False
+            await self.convector.set_opened_window("on")
+            await self.async_set_hvac_mode(HVACMode.OFF, _from_window_detection=True)
+            _LOGGER.info("Window open detected. Rate = %.2f °C/min", trend)
 
-        if temperature_entity and use_external_temp:
-            temp_state = self.hass.states.get(temperature_entity)
-            temp = None
+        elif self._window_opened:
+            if self._window_change_time is None:
+                self._window_change_time = now
+            if self._min_temp_during_open is None or current_temp < self._min_temp_during_open:
+                self._min_temp_during_open = current_temp
 
-            if temp_state and temp_state.state not in ("unavailable", "unknown"):
-                try:
-                    temp_val = float(temp_state.state)
-                    if -40.0 <= temp_val <= 80.0:
-                        # Apply EMA — same filter the sw-controller uses
-                        if self._ema_temp is None:
-                            self._ema_temp = temp_val
-                        else:
-                            self._ema_temp = ema_alpha * temp_val + (1.0 - ema_alpha) * self._ema_temp
-                        temp = self._ema_temp
-                except ValueError:
-                    _LOGGER.warning(
-                        "Invalid temperature from %s: %s",
-                        temperature_entity,
-                        temp_state.state,
-                    )
-                    if self._sw_device_on is not None:
-                        await self._restore_firmware_control()
-                    if self._window_opened:
-                        await self._close_window(now)
-                    self._current_temp = self._extract_internal_temp(status)
-                    self._temp_history = []
-                    return
+            time_open = now - self._window_change_time
+            dtemp = (
+                current_temp - self._min_temp_during_open
+                if self._min_temp_during_open is not None
+                else 0
+            )
+            recovery_ok = (
+                time_open > WINDOW_RECOVERY_HYSTERESIS_SEC
+                and (trend > temp_recovery_rate or dtemp > temp_recovery_abs)
+            )
+            timeout = time_open > WINDOW_OPEN_TIMEOUT_SEC
 
-            # --- External sensor unavailable or out-of-range ---
-            if temp is None:
-                if not self._ext_sensor_unavailable_logged:
-                    _LOGGER.warning(
-                        "External temperature entity '%s' is unavailable or invalid — "
-                        "falling back to device firmware control.",
-                        temperature_entity,
-                    )
-                    self._ext_sensor_unavailable_logged = True
-
-                # Restore device firmware control if sw-controller was active
-                if self._sw_device_on is not None:
-                    await self._restore_firmware_control()
-
-                # Close any open window so device is not stuck OFF
-                if self._window_opened:
-                    await self._close_window(now)
-
-                # Reset EMA so it re-seeds cleanly when sensor returns
-                self._ema_temp = None
-                # Show internal sensor temp if available
-                self._current_temp = self._extract_internal_temp(status)
-                self._temp_history = []
-                self._ema_temp = None  # reset EMA — stale value discarded
-                return
-
-            # Sensor back online — clear the warning flag
-            if self._ext_sensor_unavailable_logged:
-                _LOGGER.info(
-                    "External temperature entity '%s' is available again.",
-                    temperature_entity,
-                )
-                self._ext_sensor_unavailable_logged = False
-
-            # _ema_temp was already updated in the temp_val block above.
-            # Use it as the filtered current temperature.
-            filtered_temp = self._ema_temp if self._ema_temp is not None else temp
-            self._current_temp = filtered_temp
-
-            if temp is not None and window_open_enabled:
-                self._temp_history.append((now, filtered_temp))
-                self._temp_history = [x for x in self._temp_history if now - x[0] <= 180]
-
-                trend = self.estimate_temp_trend(self._temp_history)
-
-                # Mark detection as ready once we have a valid trend estimate
-                # (i.e. enough history has accumulated since boot/restart).
-                if trend is not None and not self._window_detection_ready:
-                    self._window_detection_ready = True
+            if recovery_ok or timeout:
+                if timeout:
+                    _LOGGER.warning("Window open timeout — restoring HVAC mode")
+                else:
                     _LOGGER.info(
-                        "Window detection: sufficient history accumulated — detection active"
+                        "Window closed. Recovery rate=%.2f °C/min, delta=%.2f °C",
+                        trend, dtemp,
                     )
-
-                if trend is None or not self._window_detection_ready:
-                    return
-
-                # Check re-detection inhibit — user may have dismissed the
-                # window event while temperature was still falling.
-                if (
-                    self._window_inhibit_until is not None
-                    and now < self._window_inhibit_until
-                ):
-                    remaining = self._window_inhibit_until - now
-                    _LOGGER.debug(
-                        "Window detection inhibited — %.0fs remaining", remaining
-                    )
-                    return
-
-                if not self._window_opened and trend < -temp_fall_rate:
-                    self._window_opened = True
-                    self._prev_hvac_mode = self._hvac_mode
-                    self._window_change_time = now
-                    self._min_temp_during_open = temp
-                    self._temp_history = []
-                    self._window_detection_ready = False
-                    await self.convector.set_opened_window("on")
-                    await self.async_set_hvac_mode(HVACMode.OFF, _from_window_detection=True)
-                    _LOGGER.info("Window open detected. Rate = %.2f °C/min", trend)
-
-                elif self._window_opened:
-                    if self._window_change_time is None:
-                        self._window_change_time = now
-                    if self._min_temp_during_open is None or temp < self._min_temp_during_open:
-                        self._min_temp_during_open = temp
-
-                    time_open = now - self._window_change_time
-                    dtemp = (
-                        temp - self._min_temp_during_open
-                        if self._min_temp_during_open is not None
-                        else 0
-                    )
-                    recovery_ok = (
-                        time_open > WINDOW_RECOVERY_HYSTERESIS_SEC
-                        and (trend > temp_recovery_rate or dtemp > temp_recovery_abs)
-                    )
-                    timeout = time_open > WINDOW_OPEN_TIMEOUT_SEC
-
-                    if recovery_ok or timeout:
-                        if timeout:
-                            _LOGGER.warning("Window open timeout — restoring HVAC mode")
-                        else:
-                            _LOGGER.info(
-                                "Window closed. Recovery rate=%.2f °C/min, delta=%.2f °C",
-                                trend, dtemp,
-                            )
-                        await self._close_window(now)
-        else:
-            self._current_temp = self._extract_internal_temp(status)
+                await self._close_window(now)
 
     def _extract_internal_temp(self, status: dict) -> float | None:
         """Extract current temperature from device status payload (tempAir key)."""
@@ -1074,22 +886,6 @@ class TesyConvectorClimate(ClimateEntity):
             return status["payload"]["tempAir"]["payload"]["temp"]
         except (KeyError, TypeError):
             return None
-
-    def _update_current_temp_from_entity_or_status(
-        self,
-        temperature_entity: str | None,
-        use_external_temp: bool,
-        status: dict,
-    ) -> None:
-        if temperature_entity and use_external_temp:
-            temp_state = self.hass.states.get(temperature_entity)
-            if temp_state and temp_state.state not in ("unavailable", "unknown"):
-                try:
-                    self._current_temp = float(temp_state.state)
-                    return
-                except ValueError:
-                    pass
-        self._current_temp = self._extract_internal_temp(status)
 
     async def _close_window(self, now: float, user_initiated: bool = False) -> None:
         """Close window state, restore HVAC mode, reset detection state.
@@ -1125,7 +921,7 @@ class TesyConvectorClimate(ClimateEntity):
             self._prev_hvac_mode = None
 
         # Reset sw-controller so it re-evaluates cleanly after window closes
-        self._sw_device_on = None
+        self._reset_sw_controller()
         self._update_hvac_action()
 
     # ------------------------------------------------------------------
@@ -1162,18 +958,8 @@ class TesyConvectorClimate(ClimateEntity):
         options = self._get_options()
         sw_control = options.get(CONF_SW_CONTROL_ENABLED, False)
 
-        if self._hvac_mode == HVACMode.HEAT and sw_control:
-            # Append duty cycle % to action string when available
-            duty = self._sw_duty_pct
-            if duty is not None:
-                self._attr_hvac_action = (  # type: ignore[assignment]
-                    f"heating ({duty}%)" if self._sw_device_on is True
-                    else f"idle ({duty}%)"
-                )
-            else:
-                self._attr_hvac_action = (
-                    HVACAction.HEATING if self._sw_device_on is True else HVACAction.IDLE
-                )
+        if self._hvac_mode == HVACMode.HEAT and sw_control and not self._sw_fallback_active:
+            self._attr_hvac_action = HVACAction.HEATING if self._sw_device_on is True else HVACAction.IDLE
             return
 
         if self._hvac_mode == HVACMode.AUTO:
@@ -1195,6 +981,25 @@ class TesyConvectorClimate(ClimateEntity):
         options = self._get_options()
         if not options.get(CONF_SW_CONTROL_ENABLED, False):
             return attrs
+        state = "SW_DISABLED"
+        if self._window_opened:
+            state = "WINDOW_INHIBIT"
+        elif self._hvac_mode == HVACMode.HEAT:
+            state = "SW_WAITING_FOR_SENSOR" if self._sw_fallback_active else (
+                "SW_HEATING" if self._sw_device_on else "SW_IDLE"
+            )
+        attrs.update({
+            "sw_control_state": state,
+            "external_temp_valid": self._external_temp_valid,
+            "external_temp_age_sec": round(self._external_temp_age_sec, 1) if self._external_temp_age_sec is not None else None,
+            "filtered_external_temp": self._ema_temp,
+            "firmware_fallback_active": self._sw_fallback_active,
+            "overshoot_correction": round(self._sw_overshoot_correction, 3),
+            "i_correction": self._sw_i_correction,
+            "ramp_rate_c_per_min": self._sw_ramp_rate,
+            "predicted_temp": self._sw_predicted_temp,
+            "effective_off_threshold": self._sw_effective_off_threshold,
+        })
         if self._sw_duty_pct is not None:
             attrs["duty_cycle_pct"] = self._sw_duty_pct
         if self._sw_duty_cycles:
@@ -1244,31 +1049,20 @@ class TesyConvectorClimate(ClimateEntity):
             # _close_window already cleared window flags and sent set_opened_window(off).
             # Fall through to set the requested mode normally below.
 
+        options = self._get_options()
+        sw_control = options.get(CONF_SW_CONTROL_ENABLED, False)
         if hvac_mode == HVACMode.HEAT:
-            options = self._get_options()
-            sw_control = options.get(CONF_SW_CONTROL_ENABLED, False)
-            if sw_control:
-                # Set device to heating mode — sw-controller plays the setpoint
-                # up/down to control the element, so the device must stay in
-                # heating mode permanently. set_device_on=None forces the
-                # controller to re-evaluate temperature on next poll.
-                await self.convector.set_mode("heating")
-                self._sw_device_on = None  # force re-evaluation on next poll
-            else:
-                # Plain HEAT — device firmware thermostat controls the element.
-                await self.convector.set_mode("heating")
-                # Restore real setpoint if sw-control left a safety-cap value.
-                if self._sw_device_on is not None and self._target_temp is not None:
-                    await self.convector.set_temperature(int(self._target_temp))
-                    await asyncio.sleep(0.1)
-                self._sw_device_on = None
+            if not sw_control:
+                await self._set_firmware_target()
+            await self.convector.set_mode("heating")
         elif hvac_mode == HVACMode.OFF:
             await self.convector.turn_off()
-            self._sw_device_on = None
+            await self._set_firmware_target()
         elif hvac_mode == HVACMode.AUTO:
-            # Switching to AUTO — device manages its own schedule.
-            self._sw_device_on = None
+            await self._set_firmware_target()
             await self.convector.set_mode("program")
+        self._reset_sw_controller()
+        self._sw_fallback_active = False
         await asyncio.sleep(0.1)
 
         # If window is still open (user set OFF while window open) track the
@@ -1336,7 +1130,10 @@ class TesyConvectorClimate(ClimateEntity):
         if sw_control:
             self._target_temp = temp
             self._persist_setpoint(temp)
-            self._sw_device_on = None  # force re-evaluation on next poll cycle
+            self._reset_sw_controller()
+            if self._sw_fallback_active:
+                await self._set_firmware_target()
+                return
             # Safety setpoint: ceil(target) so the device thermostat cuts off
             # just above the real target if HA ever loses control.
             safety_setpoint = math.ceil(temp)   # e.g. 20.5→21, 20.0→20
