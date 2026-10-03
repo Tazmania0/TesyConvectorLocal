@@ -55,6 +55,10 @@ from .tesy_convector import TesyConvector
 
 _LOGGER = logging.getLogger(__name__)
 
+
+class DeviceCommandError(RuntimeError):
+    """A failed device write that must remain retryable during polling."""
+
 SET_OPENED_WINDOW_SCHEMA = vol.Schema(
     {
         vol.Required("entity_id"): vol.Any(cv.entity_id, [cv.entity_id]),
@@ -239,6 +243,8 @@ class TesyConvectorClimate(ClimateEntity):
         self._comm_failed_at: float | None = None
         self._comm_retry_interval: float = 30.0  # seconds between retry attempts
         self._comm_failures = 0
+        self._control_error_logged = False
+        self._pending_boot_mode = None
 
         # Entity availability — False while device is unreachable.
         # HA blocks commands and automations when unavailable.
@@ -351,7 +357,8 @@ class TesyConvectorClimate(ClimateEntity):
                 await self.async_update()
             else:
                 self._hvac_mode = restored_mode
-                await self.async_set_hvac_mode(restored_mode)
+                self._pending_boot_mode = restored_mode
+                await self.async_update()
 
     async def async_will_remove_from_hass(self):
         if self._remove_update_listener:
@@ -363,6 +370,22 @@ class TesyConvectorClimate(ClimateEntity):
     # ------------------------------------------------------------------
 
     async def async_update(self, *args):
+        """Keep transient control failures from aborting entity setup or polls."""
+        try:
+            await self._async_update(*args)
+        except DeviceCommandError as exc:
+            self._comm_failed_at = self.hass.loop.time()
+            if not self._control_error_logged:
+                _LOGGER.warning("Tesy control command failed; retrying on a later poll: %s", exc)
+                self._control_error_logged = True
+            self._update_hvac_action()
+            self.async_write_ha_state()
+        else:
+            if self._control_error_logged and self._comm_failed_at is None:
+                _LOGGER.info("Tesy control communication restored")
+                self._control_error_logged = False
+
+    async def _async_update(self, *args):
         """Fetch device state, run window detection, run sw-controller."""
         options = self._get_options()
         window_open_enabled = options.get(CONF_WINDOW_OPEN_ENABLED, False)
@@ -395,6 +418,10 @@ class TesyConvectorClimate(ClimateEntity):
                 )
                 return
             _LOGGER.debug("Tesy Convector: retry attempt after %.0fs", elapsed)
+
+        if self._pending_boot_mode is not None:
+            await self.async_set_hvac_mode(self._pending_boot_mode)
+            self._pending_boot_mode = None
 
         status = await self.convector.get_status(source="climate.async_update")
         _LOGGER.debug("Tesy Convector status: %s", status)
@@ -737,7 +764,7 @@ class TesyConvectorClimate(ClimateEntity):
         if self._target_temp is not None:
             result = await self.convector.set_temperature(math.floor(self._target_temp), source="climate._set_firmware_target")
             if isinstance(result, dict) and "error" in result:
-                raise RuntimeError(f"Could not restore firmware target: {result['error']}")
+                raise DeviceCommandError(f"Could not restore firmware target: {result['error']}")
 
     async def _enter_firmware_fallback(self, reason: str) -> None:
         """Transfer ownership once, including when SW state is unknown at boot."""
@@ -748,7 +775,7 @@ class TesyConvectorClimate(ClimateEntity):
         await self._set_firmware_target()
         result = await self.convector.set_mode("heating", source="climate._enter_firmware_fallback")
         if isinstance(result, dict) and "error" in result:
-            raise RuntimeError(f"Could not enable firmware heating: {result['error']}")
+            raise DeviceCommandError(f"Could not enable firmware heating: {result['error']}")
         self._reset_sw_controller()
         self._sw_fallback_active = True
         if self._current_temp is not None:
@@ -861,11 +888,11 @@ class TesyConvectorClimate(ClimateEntity):
         # firmware protection. Live telemetry can justify bounded ON headroom.
         result = await self.convector.set_temperature(device_target, source="climate._run_sw_controller")
         if isinstance(result, dict) and "error" in result:
-            raise RuntimeError(f"Could not apply SW phase: {result['error']}")
+            raise DeviceCommandError(f"Could not apply SW phase: {result['error']}")
         if self._sw_device_on is None:
             result = await self.convector.set_mode("heating", source="climate._run_sw_controller")
             if isinstance(result, dict) and "error" in result:
-                raise RuntimeError(f"Could not enable SW heating mode: {result['error']}")
+                raise DeviceCommandError(f"Could not enable SW heating mode: {result['error']}")
         self._sw_headroom = headroom
         self._sw_applied_setpoint = device_target
         self._sw_applied_at = now

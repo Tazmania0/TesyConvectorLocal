@@ -740,6 +740,62 @@ def test_failed_mode_write_does_not_claim_fallback(entity):
     assert entity._sw_fallback_active
 
 
+@pytest.mark.parametrize('method', ['set_temperature', 'set_mode'])
+def test_restart_fallback_connection_reset_keeps_entity_and_retries(entity, method, caplog):
+    entity._config_entry.options.update({
+        const.CONF_LAST_HVAC_MODE: 'heat', const.CONF_LAST_SETPOINT: 22.0,
+    })
+    entity.sensor = sensor('unavailable')
+    original = getattr(entity.convector, method)
+    failed_write = AsyncMock(return_value={'error': '[Errno 104] Connection reset by peer'})
+    setattr(entity.convector, method, failed_write)
+    asyncio.run(entity.async_added_to_hass())
+    assert entity._remove_update_listener is not None
+    assert entity._attr_available
+    assert not entity._sw_fallback_active
+    assert entity._sw_device_on is None
+    assert entity._control_error_logged
+    poll(entity, 'unavailable', dt=2)
+    assert failed_write.await_count == 1
+    assert caplog.text.count('Tesy control command failed') == 1
+    setattr(entity.convector, method, original)
+    poll(entity, 'unavailable', dt=8)
+    assert entity._sw_fallback_active
+    assert not entity._control_error_logged
+    poll(entity, 21.6)
+    assert not entity._sw_fallback_active
+    assert entity._sw_device_on is True
+
+
+def test_restart_failed_first_software_phase_remains_retryable(entity):
+    entity._config_entry.options.update({
+        const.CONF_LAST_HVAC_MODE: 'heat', const.CONF_LAST_SETPOINT: 22.0,
+    })
+    original = entity.convector.set_temperature
+    entity.convector.set_temperature = AsyncMock(return_value={'error': 'connection reset'})
+    asyncio.run(entity.async_added_to_hass())
+    assert entity._sw_device_on is None
+    assert entity._attr_available
+    entity.convector.set_temperature = original
+    poll(entity, 21.6)
+    assert entity._sw_device_on is True
+
+
+def test_restart_off_target_failure_preserves_pending_mode_until_retry(entity):
+    entity._config_entry.options.update({
+        const.CONF_LAST_HVAC_MODE: 'off', const.CONF_LAST_SETPOINT: 22.0,
+    })
+    original = entity.convector.set_temperature
+    entity.convector.set_temperature = AsyncMock(return_value={'error': 'connection reset'})
+    asyncio.run(entity.async_added_to_hass())
+    assert entity._pending_boot_mode == HVACMode.OFF
+    entity.convector.set_temperature = original
+    poll(entity, 21.6)
+    assert entity._pending_boot_mode is None
+    assert entity.hvac_mode == HVACMode.OFF
+    assert not entity.convector.on
+
+
 def test_sensor_change_seeds_new_history(entity):
     poll(entity, 21.6)
     entity._sw_overshoot_correction = 0.2
