@@ -212,11 +212,11 @@ class TesyConvectorClimate(ClimateEntity):
         self._sw_restore_pending: dict | None = None
 
         # Communication failure tracking — retry gate
-        # When the device is unreachable, _comm_failed_at records the loop.time()
-        # of the first failure.  Polls are skipped (stale state preserved) until
-        # 30 seconds have elapsed, then one retry attempt is made.
+        # Record the last failed poll. Transient failures retain state and
+        # permit a retry after 5s; three failures mark an outage with 30s backoff.
         self._comm_failed_at: float | None = None
         self._comm_retry_interval: float = 30.0  # seconds between retry attempts
+        self._comm_failures = 0
 
         # Entity availability — False while device is unreachable.
         # HA blocks commands and automations when unavailable.
@@ -359,16 +359,17 @@ class TesyConvectorClimate(ClimateEntity):
         sw_i_gain    = float(options.get(CONF_SW_I_GAIN,    DEFAULT_SW_I_GAIN))
 
         # -- Retry gate -------------------------------------------------------
-        # If the last poll failed, skip this poll unless 30s have elapsed.
+        # Confirm transient failures promptly; use 30s backoff for an outage.
         # This avoids flooding the device while it is unreachable and keeps
         # the stale state intact so the widget and sw-controller stay stable.
         now_mono = self.hass.loop.time()
+        retry_interval = 5.0 if self._attr_available else self._comm_retry_interval
         if self._comm_failed_at is not None:
             elapsed = now_mono - self._comm_failed_at
-            if elapsed < self._comm_retry_interval:
+            if elapsed < retry_interval:
                 _LOGGER.debug(
                     "Tesy Convector: skipping poll — retrying in %.0fs",
-                    self._comm_retry_interval - elapsed,
+                    retry_interval - elapsed,
                 )
                 return
             _LOGGER.debug("Tesy Convector: retry attempt after %.0fs", elapsed)
@@ -385,6 +386,7 @@ class TesyConvectorClimate(ClimateEntity):
                 _LOGGER.info("Tesy Convector response structure recovered")
                 self._bad_response_logged = False
             self._comm_failed_at = None  # clear retry gate on success
+            self._comm_failures = 0
             if not self._attr_available:
                 _LOGGER.info("Tesy Convector is back online — restoring availability")
                 self._attr_available = True
@@ -574,9 +576,9 @@ class TesyConvectorClimate(ClimateEntity):
             self._update_hvac_action()
         else:
             if "error" in status:
-                # Transient comm failure — record time for retry gate.
-                if self._comm_failed_at is None:
-                    self._comm_failed_at = now_mono
+                self._comm_failed_at = now_mono
+                self._comm_failures += 1
+                if self._comm_failures >= 3 and self._attr_available:
                     _LOGGER.warning(
                         "Tesy Convector unreachable — marking unavailable, "
                         "retrying in %.0fs: %s",
@@ -589,9 +591,11 @@ class TesyConvectorClimate(ClimateEntity):
                     self._sw_fallback_active = False
                     self._update_hvac_action()
                     self.async_write_ha_state()
-                else:
-                    # Ongoing outage — update timestamp for next 30s window
-                    self._comm_failed_at = now_mono
+                elif self._attr_available:
+                    _LOGGER.debug(
+                        "Tesy status poll failed (%s/3); retaining state until next poll",
+                        self._comm_failures,
+                    )
             elif not self._bad_response_logged:
                 _LOGGER.error(
                     "Unexpected response structure from Tesy Convector: %s", status

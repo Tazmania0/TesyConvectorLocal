@@ -28,9 +28,15 @@ class TesyConvector:
         self._session = session
         self._unavailable_logged = False
         self._json_error_logged = False
+        self._request_lock = asyncio.Lock()
 
     async def send_command(self, endpoint, payload, source=None):
-        """Send one request; log origin/timing without changing the retry policy."""
+        """Serialize requests to the heater's limited local HTTP server."""
+        async with self._request_lock:
+            return await self._send_command(endpoint, payload, source)
+
+    async def _send_command(self, endpoint, payload, source=None):
+        """Send once; never replay a potentially applied control write."""
         url = f"{self.base_url}/{endpoint}"
         started = monotonic()
         source = source or endpoint

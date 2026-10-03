@@ -199,3 +199,34 @@ def test_optional_request_origin_is_forwarded_by_helpers():
     client.send_command = AsyncMock(return_value={})
     asyncio.run(client.set_mode('heating', source='firmware.fallback'))
     client.send_command.assert_awaited_once_with('setMode', {'name': 'heating'}, source='firmware.fallback')
+
+
+def test_poll_and_control_requests_do_not_overlap_and_cancel_releases_lock():
+    async def scenario():
+        client = TesyConvector('192.0.2.1', 'CN06AS', _MockSession())
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def request(endpoint, payload, source=None):
+            calls.append(endpoint)
+            if endpoint == 'getStatus':
+                entered.set()
+                await release.wait()
+            return {}
+
+        client._send_command = request
+        poll_task = asyncio.create_task(client.get_status())
+        await entered.wait()
+        control_task = asyncio.create_task(client.turn_off())
+        await asyncio.sleep(0)
+        assert calls == ['getStatus']
+        poll_task.cancel()
+        try:
+            await poll_task
+        except asyncio.CancelledError:
+            pass
+        await control_task
+        assert calls == ['getStatus', 'onOff']
+
+    asyncio.run(scenario())

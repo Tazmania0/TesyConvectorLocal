@@ -177,6 +177,34 @@ def test_normal_control_and_dead_band(entity):
     assert not any(call[0] == 'off' for call in entity.convector.calls)
 
 
+def test_transient_poll_failure_preserves_controller_and_recovers(entity):
+    run(entity, 21.6)
+    entity.convector.get_status = AsyncMock(return_value={'error': 'timeout'})
+    poll(entity, 21.6)
+    assert entity._attr_available
+    assert entity._sw_device_on is True
+    assert entity._comm_failures == 1
+    entity.convector.get_status = Device.get_status.__get__(entity.convector)
+    poll(entity, 21.6)
+    assert entity._attr_available
+    assert entity._comm_failures == 0
+    assert entity._comm_failed_at is None
+
+
+def test_repeated_poll_failures_mark_unavailable_and_back_off(entity):
+    entity.convector.get_status = AsyncMock(return_value={'error': 'timeout'})
+    for _ in range(3):
+        poll(entity, 21.6)
+    assert not entity._attr_available
+    assert entity._sw_device_on is None
+    poll(entity, 21.6)
+    assert entity.convector.get_status.await_count == 3
+    entity.convector.get_status = Device.get_status.__get__(entity.convector)
+    poll(entity, 21.6, dt=30)
+    assert entity._attr_available
+    assert entity._comm_failures == 0
+
+
 def test_initial_idle_enforces_minimum_off(entity):
     run(entity, 21.8)
     assert entity._sw_device_on is False
