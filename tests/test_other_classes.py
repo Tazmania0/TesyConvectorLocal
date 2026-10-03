@@ -3,6 +3,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from unittest.mock import Mock
 
 
 class _NumberEntity:
@@ -254,3 +255,13 @@ def test_integration_options_update_only_writes_when_correction_present():
     asyncio.run(integration._async_options_updated(hass, entry_without_correction))
 
     assert device.calls == [-1]
+
+
+def test_window_service_removed_only_after_last_entry_unloads():
+    entries = {'a': {'device': object()}, 'b': {'device': object()}}
+    services = types.SimpleNamespace(has_service=lambda *args: True, async_remove=Mock())
+    hass = types.SimpleNamespace(data={const.DOMAIN: entries}, services=services, config_entries=_DummyConfigEntryManager())
+    assert asyncio.run(integration.async_unload_entry(hass, _DummyEntry(entry_id='a')))
+    services.async_remove.assert_not_called()
+    assert asyncio.run(integration.async_unload_entry(hass, _DummyEntry(entry_id='b')))
+    services.async_remove.assert_called_once_with(const.DOMAIN, 'set_opened_window')

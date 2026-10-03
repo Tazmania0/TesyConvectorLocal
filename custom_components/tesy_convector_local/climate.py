@@ -55,7 +55,7 @@ _LOGGER = logging.getLogger(__name__)
 
 SET_OPENED_WINDOW_SCHEMA = vol.Schema(
     {
-        vol.Required("entity_id"): cv.entity_id,
+        vol.Required("entity_id"): vol.Any(cv.entity_id, [cv.entity_id]),
         vol.Required("status"): vol.In(["on", "off"]),
     }
 )
@@ -68,24 +68,28 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
     hass.data[DOMAIN][config_entry.entry_id]["climate_entity"] = entity
     async_add_entities([entity])
 
-    schema, handler = _create_window_service_handler(hass, config_entry.entry_id)
-    hass.services.async_register(DOMAIN, "set_opened_window", handler, schema=schema)
+    if not hass.services.has_service(DOMAIN, "set_opened_window"):
+        schema, handler = _create_window_service_handler(hass)
+        hass.services.async_register(DOMAIN, "set_opened_window", handler, schema=schema)
 
 
-def _create_window_service_handler(hass: HomeAssistant, entry_id: str):
+def _create_window_service_handler(hass: HomeAssistant):
     async def handle(call):
-        entity_id = call.data["entity_id"]
+        entity_ids = call.data["entity_id"]
+        requested = {entity_ids} if isinstance(entity_ids, str) else set(entity_ids)
         status = call.data["status"]
-        entity = hass.data[DOMAIN][entry_id].get("climate_entity")
-        if not entity:
-            _LOGGER.error("Climate entity not found for entry_id %s", entry_id)
-            return
-        if entity.entity_id != entity_id:
+        matched = set()
+        # Resolve current entries at call time, including later additions or
+        # reloads. Always use the climate handler to preserve window safety.
+        for entry_data in list(hass.data.get(DOMAIN, {}).values()):
+            entity = entry_data.get("climate_entity")
+            if entity is not None and entity.entity_id in requested:
+                await entity.async_handle_manual_window_status(status)
+                matched.add(entity.entity_id)
+        if missing := requested - matched:
             _LOGGER.warning(
-                "set_opened_window: entity ID mismatch, ignoring call to %s", entity_id
+                "set_opened_window: no Tesy climate entity matched %s", sorted(missing)
             )
-            return
-        await entity.async_handle_manual_window_status(status)
 
     return SET_OPENED_WINDOW_SCHEMA, handle
 
@@ -143,6 +147,9 @@ class TesyConvectorClimate(ClimateEntity):
         # External sensor availability tracking
         self._external_temp_age_sec: float | None = None
         self._external_temp_valid = False
+        self._external_raw_temp: float | None = None
+        self._internal_temp: float | None = None
+        self._sw_firmware_limit_estimated: bool | None = None
         self._external_temp_reason = "missing sensor"
         self._external_sensor_entity: str | None = None
         self._sw_fallback_active = False
@@ -222,7 +229,7 @@ class TesyConvectorClimate(ClimateEntity):
         if correction is None:
             return
         try:
-            await self.convector.set_temperature_correction(int(correction))
+            await self.convector.set_temperature_correction(int(correction), source="climate._apply_stored_temperature_correction")
             _LOGGER.debug(
                 "Applied stored temperature correction %s°C after reconnect",
                 correction,
@@ -261,7 +268,7 @@ class TesyConvectorClimate(ClimateEntity):
         #    temperature history starts fresh and cannot cause a false
         #    window-open detection from stale pre-boot readings.
         try:
-            await self.convector.set_opened_window("off")
+            await self.convector.set_opened_window("off", source="climate.async_added_to_hass")
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("Boot: could not clear window state on device: %s", exc)
 
@@ -350,7 +357,7 @@ class TesyConvectorClimate(ClimateEntity):
                 return
             _LOGGER.debug("Tesy Convector: retry attempt after %.0fs", elapsed)
 
-        status = await self.convector.get_status()
+        status = await self.convector.get_status(source="climate.async_update")
         _LOGGER.debug("Tesy Convector status: %s", status)
 
         if (
@@ -408,7 +415,7 @@ class TesyConvectorClimate(ClimateEntity):
             # below setpoint — same proxy works here too.
             #
             # sw-control: _sw_device_on is used instead (per-cycle precision).
-            # device_on is always True in sw-control OFF phase (setpoint=floor-1)
+            # device_on is always True in sw-control OFF phase (minimum setpoint)
             # so skip the device_on check — _update_hvac_action uses _sw_device_on.
             if sw_control and self._hvac_mode == HVACMode.HEAT:
                 internal_temp = self._extract_internal_temp(status)
@@ -488,11 +495,11 @@ class TesyConvectorClimate(ClimateEntity):
                 else:
                     # Setpoint changed externally — update target and let
                     # sw-controller adapt on next cycle using new value.
-                    # Ignore sw-controller's own setpoint writes (ceil / floor-1).
+                    # Ignore controller writes, including the legacy OFF value.
                     if self._target_temp is not None:
                         sw_on_sp = math.ceil(self._target_temp)
                         sw_off_sp = math.floor(self._target_temp) - 1
-                        is_sw_setpoint = device_setpoint in (sw_on_sp, sw_off_sp, math.floor(self._target_temp))
+                        is_sw_setpoint = device_setpoint in (sw_on_sp, sw_off_sp, self._attr_min_temp, math.floor(self._target_temp))
                     else:
                         is_sw_setpoint = False
                     if not is_sw_setpoint and device_setpoint != self._target_temp:
@@ -506,6 +513,7 @@ class TesyConvectorClimate(ClimateEntity):
                         self._sw_fallback_active = False
                         self.async_write_ha_state()
 
+            self._internal_temp = self._extract_internal_temp(status)
             external_temp = self._get_external_temp(temperature_entity, sw_ema_alpha)
             self._current_temp = (
                 external_temp if external_temp is not None else self._extract_internal_temp(status)
@@ -540,6 +548,13 @@ class TesyConvectorClimate(ClimateEntity):
                         lag_time_min=sw_lag_time,
                         i_gain=sw_i_gain,
                     )
+            # The device can veto our ON request through its own thermostat.
+            # This is an estimate, not a measured element/power signal.
+            self._sw_firmware_limit_estimated = (
+                self._internal_temp >= math.ceil(self._target_temp)
+                if self._sw_device_on is True and self._internal_temp is not None
+                and self._target_temp is not None else None
+            )
             self._update_hvac_action()
         else:
             if "error" in status:
@@ -655,11 +670,12 @@ class TesyConvectorClimate(ClimateEntity):
         self._sw_predicted_temp = None
         self._sw_effective_off_threshold = None
         self._sw_i_correction = None
+        self._sw_firmware_limit_estimated = None
 
     async def _set_firmware_target(self) -> None:
         """Restore the integer firmware target, preferring slight undershoot."""
         if self._target_temp is not None:
-            result = await self.convector.set_temperature(math.floor(self._target_temp))
+            result = await self.convector.set_temperature(math.floor(self._target_temp), source="climate._set_firmware_target")
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(f"Could not restore firmware target: {result['error']}")
 
@@ -670,7 +686,7 @@ class TesyConvectorClimate(ClimateEntity):
         # Set the safety target before enabling heating. Failed writes must
         # remain retryable rather than claiming that fallback was applied.
         await self._set_firmware_target()
-        result = await self.convector.set_mode("heating")
+        result = await self.convector.set_mode("heating", source="climate._enter_firmware_fallback")
         if isinstance(result, dict) and "error" in result:
             raise RuntimeError(f"Could not enable firmware heating: {result['error']}")
         self._reset_sw_controller()
@@ -761,14 +777,16 @@ class TesyConvectorClimate(ClimateEntity):
             if now - self._sw_last_on_time < min_on_sec:
                 return
 
-        # Keep the TCP connection alive by lowering the thermostat for OFF;
-        # ceil(target) provides the firmware safety limiter for ON.
-        device_target = math.ceil(setpoint) if desired_on else math.floor(setpoint) - 1
-        result = await self.convector.set_temperature(device_target)
+        # Keep the TCP connection alive by lowering the thermostat for OFF.
+        # floor(target)-1 could still heat if the internal sensor reads colder
+        # than the room sensor. Use the supported minimum, retaining low-temp
+        # firmware protection; ceil(target) remains the ON safety limiter.
+        device_target = math.ceil(setpoint) if desired_on else int(self._attr_min_temp)
+        result = await self.convector.set_temperature(device_target, source="climate._run_sw_controller")
         if isinstance(result, dict) and "error" in result:
             raise RuntimeError(f"Could not apply SW phase: {result['error']}")
         if self._sw_device_on is None:
-            result = await self.convector.set_mode("heating")
+            result = await self.convector.set_mode("heating", source="climate._run_sw_controller")
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(f"Could not enable SW heating mode: {result['error']}")
         cycle_completed = desired_on and self._sw_peak_temp is not None
@@ -815,6 +833,7 @@ class TesyConvectorClimate(ClimateEntity):
             self._temp_history = []
             self._window_detection_ready = False
         self._external_temp_valid = False
+        self._external_raw_temp = None
         self._external_temp_age_sec = None
         self._external_temp_reason = "missing"
         state = self.hass.states.get(temperature_entity) if temperature_entity else None
@@ -839,6 +858,7 @@ class TesyConvectorClimate(ClimateEntity):
             self._ema_temp = None
             return None
         self._external_temp_valid = True
+        self._external_raw_temp = raw
         alpha = max(0.0, min(1.0, ema_alpha))
         self._ema_temp = raw if self._ema_temp is None else alpha * raw + (1.0 - alpha) * self._ema_temp
         return self._ema_temp
@@ -928,7 +948,7 @@ class TesyConvectorClimate(ClimateEntity):
             self._min_temp_during_open = current_temp
             self._temp_history = []
             self._window_detection_ready = False
-            await self.convector.set_opened_window("on")
+            await self.convector.set_opened_window("on", source="climate._handle_window_detection")
             await self.async_set_hvac_mode(HVACMode.OFF, _from_window_detection=True)
             _LOGGER.info("Window open detected. Rate = %.2f °C/min", trend)
 
@@ -995,7 +1015,7 @@ class TesyConvectorClimate(ClimateEntity):
         else:
             self._window_inhibit_until = None
 
-        await self.convector.set_opened_window("off")
+        await self.convector.set_opened_window("off", source="climate._close_window")
         if self._prev_hvac_mode and self._prev_hvac_mode != HVACMode.OFF:
             await self.async_set_hvac_mode(self._prev_hvac_mode, _from_window_detection=True)
             self._prev_hvac_mode = None
@@ -1073,6 +1093,14 @@ class TesyConvectorClimate(ClimateEntity):
             "external_temp_valid": self._external_temp_valid,
             "external_temp_age_sec": round(self._external_temp_age_sec, 1) if self._external_temp_age_sec is not None else None,
             "filtered_external_temp": self._ema_temp,
+            "raw_external_temp": self._external_raw_temp,
+            "internal_temp": self._internal_temp,
+            "external_temperature_error": (
+                round(self._external_raw_temp - self._target_temp, 3)
+                if self._external_raw_temp is not None and self._target_temp is not None else None
+            ),
+            "sw_heat_requested": self._sw_device_on,
+            "firmware_limit_estimated": self._sw_firmware_limit_estimated,
             "firmware_fallback_active": self._sw_fallback_active,
             "overshoot_correction": round(self._sw_overshoot_correction, 3),
             "i_correction": self._sw_i_correction,
@@ -1134,13 +1162,13 @@ class TesyConvectorClimate(ClimateEntity):
         if hvac_mode == HVACMode.HEAT:
             if not sw_control:
                 await self._set_firmware_target()
-            await self.convector.set_mode("heating")
+            await self.convector.set_mode("heating", source="climate.async_set_hvac_mode")
         elif hvac_mode == HVACMode.OFF:
-            await self.convector.turn_off()
+            await self.convector.turn_off(source="climate.async_set_hvac_mode")
             await self._set_firmware_target()
         elif hvac_mode == HVACMode.AUTO:
             await self._set_firmware_target()
-            await self.convector.set_mode("program")
+            await self.convector.set_mode("program", source="climate.async_set_hvac_mode")
         self._reset_sw_controller()
         self._sw_fallback_active = False
         await asyncio.sleep(0.1)
@@ -1221,7 +1249,7 @@ class TesyConvectorClimate(ClimateEntity):
                 "SW ctrl: setpoint %.1f°C -> device setTemp=%d (safety backstop)",
                 temp, safety_setpoint,
             )
-            await self.convector.set_temperature(safety_setpoint)
+            await self.convector.set_temperature(safety_setpoint, source="climate.async_set_temperature")
             await asyncio.sleep(0.1)
             return
 
@@ -1232,14 +1260,14 @@ class TesyConvectorClimate(ClimateEntity):
             _LOGGER.debug(
                 "HEAT: setpoint %.1f°C -> device setTemp=%d (floor)", temp, device_setpoint
             )
-            await self.convector.set_temperature(device_setpoint)
+            await self.convector.set_temperature(device_setpoint, source="climate.async_set_temperature")
             self._target_temp = temp
             self._persist_setpoint(temp)
             await asyncio.sleep(0.1)
 
 
     async def async_set_opened_window(self, status):
-        await self.convector.set_opened_window(status)
+        await self.convector.set_opened_window(status, source="climate.async_set_opened_window")
 
     async def async_handle_manual_window_status(self, status: str) -> None:
         now = self.hass.loop.time()
@@ -1252,7 +1280,7 @@ class TesyConvectorClimate(ClimateEntity):
             self._window_change_time = now
             self._prev_hvac_mode = self.hvac_mode
             self._min_temp_during_open = self.current_temperature
-            await self.convector.set_opened_window("on")
+            await self.convector.set_opened_window("on", source="climate.async_handle_manual_window_status")
             await self.async_set_hvac_mode(HVACMode.OFF, _from_window_detection=True)
             self._window_opened = True
             _LOGGER.info("Manual window open triggered via service")

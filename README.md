@@ -42,7 +42,17 @@ Entity attributes expose sensor validity and age, filtered temperature,
 controller state, firmware fallback, prediction, effective cutoff, learned
 overshoot correction, slow average correction, and completed-cycle duty.
 Software ON retains `ceil(target)` as the device thermostat safety limit;
-software OFF lowers the setpoint to preserve the device connection.
+software OFF uses the supported minimum setpoint of 10 °C to preserve the device
+connection without the firmware continuing to heat a normally warm room.
+
+`sw_heat_requested` and `duty_cycle_pct` describe commanded phases, not measured
+element activity or electricity use. `internal_temp`, `raw_external_temp`,
+`external_temperature_error`, and `firmware_limit_estimated` help distinguish room
+undershoot from the built-in thermostat limiting an ON request. The limiter flag
+is an estimate based on the internal sensor reaching the safety setpoint.
+
+See [temperature-control assessment](docs/temperature-control.md) for simulation
+results, limitations, and how to compare software control with firmware in a room.
 
 ## Tested with:
 - Tesy Convector CN06AS
@@ -65,4 +75,8 @@ software OFF lowers the setpoint to preserve the device connection.
     data:
       entity_id: climate.tesy_convector_cn06as
       status: "on"
+
+`entity_id` also accepts a list of Tesy climate entities. The service is shared
+across heaters and always applies the normal manual window handling to each
+selected entity.
 

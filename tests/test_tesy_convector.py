@@ -62,7 +62,8 @@ class _ResponseContext:
 
 
 class _MockResponse:
-    def __init__(self, json_value=None, json_exception=None, text_value=""):
+    def __init__(self, json_value=None, json_exception=None, text_value="", status=200):
+        self.status = status
         self._json_value = json_value
         self._json_exception = json_exception
         self._text_value = text_value
@@ -151,7 +152,7 @@ def test_command_helpers_forward_to_send_command():
     asyncio.run(client.set_uv("off"))
     asyncio.run(client.lock_device("on"))
 
-    assert client.send_command.await_args_list == [
+    assert [(call.args,) for call in client.send_command.await_args_list] == [
         (("getStatus", {}),),
         (("onOff", {"status": "on"}),),
         (("onOff", {"status": "off"}),),
@@ -168,3 +169,33 @@ def test_command_helpers_forward_to_send_command():
         (("setUV", {"status": "off"}),),
         (("setLockDevice", {"status": "on"}),),
     ]
+
+
+
+
+def test_request_logs_include_origin_status_and_elapsed_time(caplog):
+    caplog.set_level('DEBUG')
+    client = TesyConvector('192.0.2.1', 'CN06AS', _MockSession(response=_MockResponse(json_value={})))
+    result = asyncio.run(client.set_temperature(22, source='sw.phase.on'))
+    assert result == {}
+    assert 'source=sw.phase.on' in caplog.text
+    assert 'http_status=200' in caplog.text
+    assert 'elapsed_ms=' in caplog.text
+
+
+def test_non_success_http_response_is_never_a_successful_control_write():
+    client = TesyConvector('192.0.2.1', 'CN06AS', _MockSession(response=_MockResponse(json_value={'ok': True}, status=503)))
+    assert asyncio.run(client.set_temperature(22)) == {'error': 'HTTP 503'}
+    assert client._unavailable_logged
+
+
+def test_non_object_json_response_is_rejected():
+    client = TesyConvector('192.0.2.1', 'CN06AS', _MockSession(response=_MockResponse(json_value=[])))
+    assert asyncio.run(client.get_status()) == {'error': 'Expected JSON object'}
+
+
+def test_optional_request_origin_is_forwarded_by_helpers():
+    client = TesyConvector('192.0.2.1', 'CN06AS', _MockSession())
+    client.send_command = AsyncMock(return_value={})
+    asyncio.run(client.set_mode('heating', source='firmware.fallback'))
+    client.send_command.assert_awaited_once_with('setMode', {'name': 'heating'}, source='firmware.fallback')

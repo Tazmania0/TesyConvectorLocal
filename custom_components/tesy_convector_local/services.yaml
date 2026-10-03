@@ -10,11 +10,12 @@ set_opened_window:
   fields:
     entity_id:
       name: Climate Entity
-      description: The `climate.` entity ID of the Tesy Convector.
+      description: One or more Tesy Convector climate entity IDs.
       required: true
       selector:
         entity:
           domain: climate
+          multiple: true
 
     status:
       name: Window Status

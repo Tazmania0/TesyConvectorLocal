@@ -91,25 +91,25 @@ class Device:
         self.on = True
         self.calls = []
 
-    async def set_temperature(self, value):
+    async def set_temperature(self, value, **kwargs):
         self.calls.append(('temperature', value))
         self.setpoint = value
         return {}
 
-    async def set_mode(self, mode):
+    async def set_mode(self, mode, **kwargs):
         self.calls.append(('mode', mode))
         self.mode = mode
         self.on = True
         return {}
 
-    async def turn_off(self):
+    async def turn_off(self, **kwargs):
         self.calls.append(('off',))
         self.on = False
 
-    async def set_opened_window(self, value):
+    async def set_opened_window(self, value, **kwargs):
         self.calls.append(('window', value))
 
-    async def get_status(self):
+    async def get_status(self, **kwargs):
         return {'payload': {
             'onOff': {'payload': {'status': 'on' if self.on else 'off'}},
             'setMode': {'payload': {'name': self.mode}},
@@ -170,7 +170,7 @@ def test_normal_control_and_dead_band(entity):
     assert len(entity.convector.calls) == before
     run(entity, 22.0)
     assert entity._sw_device_on is False
-    assert entity.convector.setpoint == 21
+    assert entity.convector.setpoint == 10
     before = len(entity.convector.calls)
     run(entity, 21.8)
     assert len(entity.convector.calls) == before
@@ -356,7 +356,7 @@ def test_single_acquisition_and_shared_ema(entity):
 def test_disabling_sw_restores_real_target(entity):
     entity._target_temp = 22.5
     poll(entity, 23.0)
-    assert entity.convector.setpoint == 21
+    assert entity.convector.setpoint == 10
     entity._config_entry.options[const.CONF_SW_CONTROL_ENABLED] = False
     poll(entity, 23.0)
     assert entity.convector.setpoint == 22
@@ -368,7 +368,7 @@ def test_disabling_sw_restores_real_target(entity):
 def test_leaving_heat_restores_sw_off_setpoint(entity, mode):
     entity._target_temp = 22.5
     poll(entity, 23.0)
-    assert entity.convector.setpoint == 21
+    assert entity.convector.setpoint == 10
     asyncio.run(entity.async_set_hvac_mode(mode))
     assert entity.convector.setpoint == 22
     assert entity._sw_device_on is None
@@ -625,3 +625,130 @@ def test_storage_write_failure_does_not_interrupt_phase_transition(entity, caplo
     run(entity, 21.6)
     assert entity._sw_device_on is True
     assert 'could not save learning' in caplog.text
+
+
+def test_window_service_routes_to_multiple_current_entries(entity, caplog):
+    first = types.SimpleNamespace(entity_id='climate.first', async_handle_manual_window_status=AsyncMock())
+    second = types.SimpleNamespace(entity_id='climate.second', async_handle_manual_window_status=AsyncMock())
+    entity.hass.data = {const.DOMAIN: {'first': {'climate_entity': first}}}
+    schema, handler = climate._create_window_service_handler(entity.hass)
+    entity.hass.data[const.DOMAIN]['second'] = {'climate_entity': second}
+    data = schema({'entity_id': ['climate.first', 'climate.second'], 'status': 'on'})
+    asyncio.run(handler(types.SimpleNamespace(data=data)))
+    first.async_handle_manual_window_status.assert_awaited_once_with('on')
+    second.async_handle_manual_window_status.assert_awaited_once_with('on')
+    del entity.hass.data[const.DOMAIN]['first']
+    asyncio.run(handler(types.SimpleNamespace(data={'entity_id': 'climate.first', 'status': 'off'})))
+    assert 'no Tesy climate entity matched' in caplog.text
+    assert second.async_handle_manual_window_status.await_count == 1
+
+
+def test_climate_setup_registers_window_service_only_once(entity):
+    handlers = {}
+    def register(domain, name, handler, **kwargs):
+        handlers[(domain, name)] = handler
+    entity.hass.services = types.SimpleNamespace(
+        has_service=lambda domain, name: (domain, name) in handlers,
+        async_register=Mock(side_effect=register),
+    )
+    entity.hass.data = {const.DOMAIN: {'test': {'device': entity.convector}, 'second': {'device': Device()}}}
+    entry2 = types.SimpleNamespace(entry_id='second', data={}, options={})
+    added = []
+    asyncio.run(climate.async_setup_entry(entity.hass, entity._config_entry, added.extend))
+    asyncio.run(climate.async_setup_entry(entity.hass, entry2, added.extend))
+    entity.hass.services.async_register.assert_called_once()
+    assert len(added) == 2
+
+
+def test_firmware_limit_estimate_and_raw_temperature_error(entity):
+    original = entity.convector.get_status
+    async def status(**kwargs):
+        value = await original(**kwargs)
+        value['payload']['tempAir']['payload']['temp'] = 23.0
+        return value
+    entity.convector.get_status = status
+    poll(entity, 21.6)
+    attrs = entity.extra_state_attributes
+    assert attrs['firmware_limit_estimated'] is True
+    assert attrs['sw_heat_requested'] is True
+    assert attrs['internal_temp'] == 23.0
+    assert attrs['external_temperature_error'] == pytest.approx(-0.4)
+    poll(entity, 'unavailable')
+    attrs = entity.extra_state_attributes
+    assert attrs['firmware_limit_estimated'] is None
+    assert attrs['external_temperature_error'] is None
+
+
+async def simulate_thermal_room(entity, *, inertia, sensor_delay, predictive):
+    """Synthetic six-hour loop, not a model of proprietary Tesy firmware.
+
+    Heater output coasts through a first-order time constant. Room heat loss
+    rises with indoor/outdoor difference. Both controllers receive the same
+    delayed sensor and EMA and obey the same minimum phase durations.
+    Reference is plain hysteresis; actual Tesy relay behavior is unknown.
+    """
+    room = sensed = filtered = 20.0
+    output = 0.0
+    samples = []
+    starts = 0
+    requested = None
+    switched_at = -60
+    for now in range(0, 21600, 10):
+        entity.clock = now
+        filtered = 0.2 * sensed + 0.8 * filtered
+        before = requested
+        if predictive:
+            await entity._run_sw_controller(filtered, 60, 60, 0.3, 6.0, 0.0)
+            requested = entity._sw_device_on
+        else:
+            desired = (
+                filtered < 22.0 if requested else filtered <= 21.7
+            )
+            if desired != requested and now - switched_at >= 60:
+                requested = desired
+                switched_at = now
+        starts += requested is True and before is not True
+        for _ in range(10):
+            output += (float(requested) - output) / inertia
+            room += 0.004 * output - 0.00008 * (room - 10.0)
+            sensed += (room - sensed) / sensor_delay
+        if now >= 14400:  # settled final two hours
+            samples.append(room)
+    return {
+        'min': min(samples), 'max': max(samples),
+        'mean_absolute_error': sum(abs(value - 22.0) for value in samples) / len(samples),
+        'starts': starts,
+    }
+
+
+@pytest.mark.parametrize('inertia,sensor_delay', [(30, 10), (90, 60), (180, 120)])
+def test_closed_loop_thermal_coast_is_bounded_and_reduces_overshoot(entity, inertia, sensor_delay):
+    reference = asyncio.run(simulate_thermal_room(entity, inertia=inertia, sensor_delay=sensor_delay, predictive=False))
+    entity._reset_sw_controller()
+    controlled = asyncio.run(simulate_thermal_room(entity, inertia=inertia, sensor_delay=sensor_delay, predictive=True))
+    assert controlled['max'] < reference['max']
+    assert controlled['max'] <= 22.2
+    assert controlled['min'] >= 21.4
+    assert controlled['mean_absolute_error'] <= 0.25
+
+
+def test_sw_off_uses_minimum_even_when_internal_sensor_is_colder(entity):
+    # Internal sensor is 20 C, room is already 22 C. A 21 C OFF setpoint
+    # would allow the firmware to keep heating against our room feedback.
+    poll(entity, 22.0)
+    assert entity._sw_device_on is False
+    assert entity.convector.setpoint == 10
+    assert entity.convector.setpoint < entity._internal_temp
+    assert entity.convector.on
+    poll(entity, 21.6, dt=60)
+    assert entity._sw_device_on is True
+    assert entity.convector.setpoint == 22
+
+
+def test_poll_does_not_treat_minimum_off_target_as_user_setpoint_change(entity):
+    entity._target_temp = 22.5
+    poll(entity, 23.0)
+    poll(entity, 23.0)
+    assert entity._sw_device_on is False
+    assert entity.convector.setpoint == 10
+    assert entity.target_temperature == 22.5
