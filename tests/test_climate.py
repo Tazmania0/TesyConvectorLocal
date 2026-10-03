@@ -7,6 +7,7 @@ import asyncio
 import importlib.util
 import sys
 import types
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from enum import IntFlag, StrEnum
 from pathlib import Path
@@ -38,6 +39,24 @@ class ClimateEntity:
         pass
 
 
+class MemoryStore:
+    """Model HA's per-entry persisted payload across new entity instances."""
+
+    def __init__(self, hass, version, key):
+        self.hass = hass
+        self.key = key
+        self.saves = 0
+        if not hasattr(hass, 'storage'):
+            hass.storage = {}
+
+    async def async_load(self):
+        return deepcopy(self.hass.storage.get(self.key))
+
+    async def async_save(self, value):
+        self.saves += 1
+        self.hass.storage[self.key] = deepcopy(value)
+
+
 sys.modules.setdefault('homeassistant', types.ModuleType('homeassistant'))
 sys.modules.setdefault('homeassistant.core', types.SimpleNamespace(HomeAssistant=object))
 sys.modules.setdefault('homeassistant.components.climate', types.SimpleNamespace(ClimateEntity=ClimateEntity))
@@ -49,6 +68,7 @@ sys.modules.setdefault('homeassistant.helpers', types.ModuleType('homeassistant.
 sys.modules.setdefault('homeassistant.helpers.config_validation', types.SimpleNamespace(entity_id=str))
 sys.modules.setdefault('homeassistant.helpers.entity', types.SimpleNamespace(DeviceInfo=dict))
 sys.modules.setdefault('homeassistant.helpers.event', types.SimpleNamespace(async_track_time_interval=lambda *args: lambda: None))
+sys.modules.setdefault('homeassistant.helpers.storage', types.SimpleNamespace(Store=MemoryStore))
 sys.modules.setdefault('aiohttp', types.SimpleNamespace(ClientError=Exception, ContentTypeError=Exception, ClientSession=object))
 ROOT = Path(__file__).resolve().parents[1]
 PKG = 'custom_components.tesy_convector_local'
@@ -461,3 +481,147 @@ def test_duty_cycle_tracks_complete_cycles(entity):
     run(entity, 21.6, dt=60)
     assert entity._sw_duty_pct == 67
     assert entity._sw_duty_cycles == [(120, 60)]
+
+
+def restarted(entity, value=21.9):
+    """Boot a new entity, retaining only entry options, storage, and device."""
+    new = climate.TesyConvectorClimate(entity.convector, entity._config_entry)
+    new.clock = entity.clock + 100
+    new.sensor = sensor(value)
+    new.hass = types.SimpleNamespace(
+        loop=types.SimpleNamespace(time=lambda: new.clock),
+        states=types.SimpleNamespace(get=Mock(side_effect=lambda _: new.sensor)),
+        config_entries=entity.hass.config_entries,
+        storage=entity.hass.storage,
+    )
+    asyncio.run(new.async_added_to_hass())
+    return new
+
+
+def saved_learning(entity, correction=0.09, cycles=None):
+    return {
+        'context': entity._sw_learning_context(),
+        'overshoot_correction': correction,
+        'duty_cycles': [[120, 60], [60, 120]] if cycles is None else cycles,
+    }
+
+
+def test_learning_saved_only_after_complete_cycle(entity):
+    entity._sw_learning_store = MemoryStore(entity.hass, 1, 'test')
+    run(entity, 21.6)
+    run(entity, 22.0, dt=120)
+    run(entity, 22.3)
+    assert entity._sw_learning_store.saves == 0
+    run(entity, 21.6)
+    assert entity._sw_learning_store.saves == 1
+    saved = entity.hass.storage['test']
+    assert saved['overshoot_correction'] == pytest.approx(0.09)
+    assert saved['duty_cycles'] == [[120, 120]]
+    assert set(saved) == {'context', 'overshoot_correction', 'duty_cycles'}
+    run(entity, 21.65)
+    assert entity._sw_learning_store.saves == 1
+
+
+def test_learning_and_duty_survive_real_restart_without_replaying_phase(entity):
+    entity._config_entry.options.update({const.CONF_LAST_HVAC_MODE: 'heat', const.CONF_LAST_SETPOINT: 22.0})
+    asyncio.run(entity.async_added_to_hass())
+    run(entity, 22.0, dt=120)
+    run(entity, 22.3, dt=60)
+    run(entity, 21.6, dt=60)
+    correction = entity._sw_overshoot_correction
+    cycles = list(entity._sw_duty_cycles)
+    duty = entity._sw_duty_pct
+    new = restarted(entity)
+    assert new._sw_overshoot_correction == pytest.approx(correction)
+    assert new._sw_duty_cycles == cycles
+    assert new._sw_duty_pct == duty
+    assert new._sw_device_on is False  # fresh sensor says idle, despite old ON
+    assert new._sw_last_on_time is None
+    assert new._sw_peak_temp is None
+    assert new._sw_long_history == [(new.clock, 21.9)]
+    # Starting the first new ON phase must not relabel a saved completed OFF.
+    run(new, 21.6, dt=60)
+    assert new._sw_duty_cycles == cycles
+    assert new._sw_learning_store.saves == 0
+    run(new, 22.0, dt=90)
+    run(new, 21.6, dt=120)
+    assert new._sw_duty_cycles[-1] == (90, 120)
+    assert new._sw_learning_store.saves == 1
+    assert new._sw_overshoot_correction == pytest.approx(correction * 0.8)
+
+
+def test_restart_startup_fallback_keeps_learning_pending_until_fresh_sensor(entity):
+    entity._config_entry.options.update({const.CONF_LAST_HVAC_MODE: 'heat', const.CONF_LAST_SETPOINT: 22.0})
+    entity.hass.storage = {f'{const.DOMAIN}.test.sw_learning': saved_learning(entity)}
+    new = restarted(entity, 'unavailable')
+    assert new._sw_fallback_active
+    assert new.convector.setpoint == 22
+    assert new._sw_overshoot_correction == 0
+    poll(new, 21.9)
+    assert not new._sw_fallback_active
+    assert new._sw_overshoot_correction == pytest.approx(0.09)
+    assert new._sw_duty_pct == 50
+    assert new._sw_long_history == [(new.clock, 21.9)]
+    assert new._sw_last_on_time is None
+
+
+@pytest.mark.parametrize('setting,value', [
+    (const.CONF_TEMPERATURE_ENTITY, 'sensor.other'),
+    (const.CONF_SW_HYSTERESIS, 0.5),
+    (const.CONF_SW_LAG_TIME, 2),
+    (const.CONF_SW_EMA_ALPHA, 0.5),
+    (const.CONF_SW_I_GAIN, 0.5),
+])
+def test_saved_learning_rejected_for_changed_settings(entity, setting, value):
+    entity._sw_restore_pending = saved_learning(entity)
+    entity._config_entry.options[setting] = value
+    run(entity, 21.9)
+    assert entity._sw_overshoot_correction == 0
+    assert entity._sw_duty_cycles == []
+
+
+def test_saved_learning_rejected_for_changed_target(entity):
+    entity._sw_restore_pending = saved_learning(entity)
+    entity._target_temp = 23.0
+    run(entity, 23.0)
+    assert entity._sw_overshoot_correction == 0
+    assert entity._sw_duty_cycles == []
+
+
+@pytest.mark.parametrize('bad_value', [
+    {}, [],
+    {'overshoot_correction': float('nan')},
+    {'overshoot_correction': float('inf')},
+    {'overshoot_correction': -0.1},
+    {'overshoot_correction': 100},
+    {'duty_cycles': [[120, 0]]},
+    {'duty_cycles': [[float('inf'), 60]]},
+    {'duty_cycles': [[120]]},
+    {'duty_cycles': None},
+])
+def test_invalid_persisted_learning_does_not_interrupt_control(entity, bad_value):
+    if isinstance(bad_value, dict) and bad_value:
+        payload = saved_learning(entity)
+        payload.update(bad_value)
+    else:
+        payload = bad_value
+    entity._sw_restore_pending = payload
+    run(entity, 21.6)
+    assert entity._sw_device_on is True
+    assert entity._sw_overshoot_correction == 0
+
+
+def test_restore_keeps_only_last_five_completed_cycles(entity):
+    entity._sw_restore_pending = saved_learning(entity, cycles=[[60, 120]] * 8)
+    run(entity, 21.9)
+    assert entity._sw_duty_cycles == [(60, 120)] * 5
+    assert entity._sw_duty_pct == 33
+
+
+def test_storage_write_failure_does_not_interrupt_phase_transition(entity, caplog):
+    entity._sw_learning_store = types.SimpleNamespace(async_save=AsyncMock(side_effect=OSError('disk full')))
+    run(entity, 21.6)
+    run(entity, 22.0)
+    run(entity, 21.6)
+    assert entity._sw_device_on is True
+    assert 'could not save learning' in caplog.text

@@ -15,6 +15,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.storage import Store
 
 from .const import (
     CONF_LAST_HVAC_MODE,
@@ -184,6 +185,8 @@ class TesyConvectorClimate(ClimateEntity):
         # Duty = avg(on / (on+off)) over last SW_DUTY_CYCLES cycles.
         self._sw_duty_cycles: list[tuple[float, float]] = []
         self._sw_duty_pct: int | None = None   # last computed duty %
+        self._sw_learning_store: Store | None = None
+        self._sw_restore_pending: dict | None = None
 
         # Communication failure tracking — retry gate
         # When the device is unreachable, _comm_failed_at records the loop.time()
@@ -242,6 +245,10 @@ class TesyConvectorClimate(ClimateEntity):
     # ------------------------------------------------------------------
 
     async def async_added_to_hass(self):
+        self._sw_learning_store = Store(
+            self.hass, 1, f"{DOMAIN}.{self._config_entry.entry_id}.sw_learning"
+        )
+        self._sw_restore_pending = await self._sw_learning_store.async_load()
         self._remove_update_listener = async_track_time_interval(
             self.hass, self.async_update, timedelta(seconds=10)
         )
@@ -567,6 +574,72 @@ class TesyConvectorClimate(ClimateEntity):
     # v0.3 — Software on/off controller
     # ------------------------------------------------------------------
 
+    def _sw_learning_context(self) -> dict:
+        """Learning is specific to the room sensor, target, and control tuning."""
+        options = self._get_options()
+        return {
+            "sensor": options.get(CONF_TEMPERATURE_ENTITY),
+            "target": self._target_temp,
+            "hysteresis": float(options.get(CONF_SW_HYSTERESIS, DEFAULT_SW_HYSTERESIS)),
+            "lag": float(options.get(CONF_SW_LAG_TIME, DEFAULT_SW_LAG_TIME)),
+            "ema": float(options.get(CONF_SW_EMA_ALPHA, DEFAULT_SW_EMA_ALPHA)),
+            "i_gain": float(options.get(CONF_SW_I_GAIN, DEFAULT_SW_I_GAIN)),
+        }
+
+    def _restore_sw_learning_if_needed(self) -> None:
+        """Restore completed-cycle learning once, after fresh feedback arrives.
+
+        Never restore an actuator phase, coast peak, temperature history, or
+        monotonic timer: none describes the heater reliably after a restart.
+        Pending learning survives startup fallback until feedback is usable.
+        """
+        saved = self._sw_restore_pending
+        self._sw_restore_pending = None
+        if saved is None:
+            return
+        context = self._sw_learning_context()
+        if not isinstance(saved, dict) or saved.get("context") != context:
+            _LOGGER.debug("SW controller: saved learning does not match current settings")
+            return
+        try:
+            correction = float(saved["overshoot_correction"])
+            cycles = saved["duty_cycles"]
+            if not isinstance(cycles, list) or not 0 <= correction <= context["hysteresis"]:
+                raise ValueError("Invalid learned correction or duty cycles")
+            complete = []
+            for cycle in cycles[-5:]:
+                on, off = cycle
+                on, off = float(on), float(off)
+                if not (math.isfinite(on) and math.isfinite(off) and on > 0 and off > 0):
+                    raise ValueError("Invalid completed cycle durations")
+                complete.append((on, off))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            _LOGGER.warning("SW controller: invalid saved learning ignored")
+            return
+        self._sw_overshoot_correction = correction
+        self._sw_duty_cycles = complete
+        self._sw_duty_pct = (
+            round(100 * mean(on / (on + off) for on, off in complete)) if complete else None
+        )
+        _LOGGER.info(
+            "SW controller: restored correction=%.3f and %d completed duty cycles",
+            correction, len(complete),
+        )
+
+    async def _save_sw_learning(self) -> None:
+        """Save once per completed heating cycle, rather than on every poll."""
+        if self._sw_learning_store is None:
+            return
+        saved = {
+            "context": self._sw_learning_context(),
+            "overshoot_correction": self._sw_overshoot_correction,
+            "duty_cycles": [[on, off] for on, off in self._sw_duty_cycles if off > 0],
+        }
+        try:
+            await self._sw_learning_store.async_save(saved)
+        except OSError as exc:
+            _LOGGER.warning("SW controller: could not save learning: %s", exc)
+
     def _reset_sw_controller(self) -> None:
         """Discard history whenever another controller may have driven the heater."""
         self._sw_device_on = None
@@ -641,6 +714,7 @@ class TesyConvectorClimate(ClimateEntity):
         """Adaptive hysteresis, cycle prediction, then slow steady-state bias."""
         if self._hvac_mode != HVACMode.HEAT or self._target_temp is None:
             return
+        self._restore_sw_learning_if_needed()
         now = self.hass.loop.time()
         self._sw_temp_history.append((now, current_temp))
         self._sw_temp_history = [(t, v) for t, v in self._sw_temp_history if now - t <= 600]
@@ -697,9 +771,13 @@ class TesyConvectorClimate(ClimateEntity):
             result = await self.convector.set_mode("heating")
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(f"Could not enable SW heating mode: {result['error']}")
+        cycle_completed = desired_on and self._sw_peak_temp is not None
         if desired_on:
             self._learn_coast_peak(hysteresis)
-            if self._sw_duty_cycles and self._sw_last_off_time is not None:
+            if (
+                self._sw_duty_cycles and self._sw_last_off_time is not None
+                and self._sw_duty_cycles[-1][1] == 0
+            ):
                 on_dur, _ = self._sw_duty_cycles[-1]
                 self._sw_duty_cycles[-1] = (on_dur, now - self._sw_last_off_time)
                 complete = [(on, off) for on, off in self._sw_duty_cycles if off > 0]
@@ -715,6 +793,8 @@ class TesyConvectorClimate(ClimateEntity):
                     self._sw_duty_cycles = self._sw_duty_cycles[-5:]
         self._sw_device_on = desired_on
         self._sw_temp_history = [(now, current_temp)]
+        if cycle_completed:
+            await self._save_sw_learning()
         _LOGGER.info(
             "SW ctrl %s: temp=%.2f predicted=%.2f cutoff=%.2f",
             "ON" if desired_on else "OFF", current_temp, predicted_temp, effective_upper,

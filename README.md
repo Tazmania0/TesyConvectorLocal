@@ -31,6 +31,13 @@ target (22.5 °C becomes 22 °C), including after restart. Recovery starts with
 fresh controller history. Sensors must report at least every three minutes,
 even when their temperature has not changed.
 
+The learned overshoot correction and last five completed duty-cycle samples are
+saved in Home Assistant storage after each completed heating cycle. They survive
+restarts and are restored once fresh sensor feedback is available, provided the
+sensor, target, and tuning settings still match. The heater phase, timers, EMA,
+temperature histories, and unfinished coast are always initialized afresh.
+Duty cycle remains a diagnostic; heating decisions continue to use live feedback.
+
 Entity attributes expose sensor validity and age, filtered temperature,
 controller state, firmware fallback, prediction, effective cutoff, learned
 overshoot correction, slow average correction, and completed-cycle duty.
