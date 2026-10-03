@@ -18,6 +18,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 
 from .const import (
+    CLOUD_TEMPERATURE_STEP,
     CONF_CLOUD_TELEMETRY_ENABLED,
     CONF_LAST_HVAC_MODE,
     CONF_LAST_SETPOINT,
@@ -108,6 +109,9 @@ class TesyConvectorClimate(ClimateEntity):
         "ramp_rate_c_per_min", "predicted_temp", "effective_off_threshold",
         "duty_cycle_pct", "duty_cycles_sampled",
         "cloud_heating", "cloud_current_temp", "cloud_telemetry_connected",
+        "sw_firmware_headroom", "sw_firmware_setpoint", "sw_observed_coast_minutes",
+        "sw_cloud_internal_rise_rate", "sw_firmware_cutoff_temperature", "sw_firmware_cutoff_eta_sec",
+        "sw_internal_coast_rise", "sw_internal_coast_seconds",
         "cloud_telemetry_age_sec",
     })
 
@@ -185,6 +189,24 @@ class TesyConvectorClimate(ClimateEntity):
         # False = device commanded OFF by sw-controller
         # None  = sw-control inactive or state unknown (will re-evaluate)
         self._sw_device_on: bool | None = None
+        self._sw_headroom = 0
+        self._sw_blocked_since = None
+        self._sw_applied_setpoint = None
+        self._sw_applied_at = None
+        self._sw_cloud_previous_heat = None
+        self._sw_cloud_coast = None
+        self._sw_observed_coast_minutes = None
+        self._sw_cloud_internal_history = []
+        self._sw_cloud_room_history = []
+        self._sw_cloud_internal_rise_rate = None
+        self._sw_cloud_internal_rate_lower = None
+        self._sw_cloud_cutoff_offset = None
+        self._sw_cloud_veto_count = 0
+        self._sw_cloud_veto_window_start = None
+        self._sw_cloud_cutoff_eta = None
+        self._sw_cloud_internal_coast = None
+        self._sw_internal_coast_rise = None
+        self._sw_internal_coast_seconds = None
         self._sw_last_on_time: float | None = None   # loop.time() of last ON command
         self._sw_last_off_time: float | None = None  # loop.time() of last OFF command
         # Separate temperature history for the sw-controller predictive cutoff.
@@ -515,7 +537,7 @@ class TesyConvectorClimate(ClimateEntity):
                     # sw-controller adapt on next cycle using new value.
                     # Ignore controller writes, including the legacy OFF value.
                     if self._target_temp is not None:
-                        sw_on_sp = math.ceil(self._target_temp)
+                        sw_on_sp = self._sw_applied_setpoint or math.ceil(self._target_temp)
                         sw_off_sp = math.floor(self._target_temp) - 1
                         is_sw_setpoint = device_setpoint in (sw_on_sp, sw_off_sp, self._attr_min_temp, math.floor(self._target_temp))
                     else:
@@ -569,7 +591,7 @@ class TesyConvectorClimate(ClimateEntity):
             # The device can veto our ON request through its own thermostat.
             # This is an estimate, not a measured element/power signal.
             self._sw_firmware_limit_estimated = (
-                self._internal_temp >= math.ceil(self._target_temp)
+                self._internal_temp >= (self._sw_applied_setpoint or math.ceil(self._target_temp))
                 if self._sw_device_on is True and self._internal_temp is not None
                 and self._target_temp is not None else None
             )
@@ -678,6 +700,24 @@ class TesyConvectorClimate(ClimateEntity):
     def _reset_sw_controller(self) -> None:
         """Discard history whenever another controller may have driven the heater."""
         self._sw_device_on = None
+        self._sw_headroom = 0
+        self._sw_blocked_since = None
+        self._sw_applied_setpoint = None
+        self._sw_applied_at = None
+        self._sw_cloud_previous_heat = None
+        self._sw_cloud_coast = None
+        self._sw_observed_coast_minutes = None
+        self._sw_cloud_internal_history = []
+        self._sw_cloud_room_history = []
+        self._sw_cloud_internal_rise_rate = None
+        self._sw_cloud_internal_rate_lower = None
+        self._sw_cloud_cutoff_offset = None
+        self._sw_cloud_veto_count = 0
+        self._sw_cloud_veto_window_start = None
+        self._sw_cloud_cutoff_eta = None
+        self._sw_cloud_internal_coast = None
+        self._sw_internal_coast_rise = None
+        self._sw_internal_coast_seconds = None
         self._sw_temp_history = []
         self._sw_long_history = []
         self._sw_last_on_time = None
@@ -754,6 +794,7 @@ class TesyConvectorClimate(ClimateEntity):
         now = self.hass.loop.time()
         self._sw_temp_history.append((now, current_temp))
         self._sw_temp_history = [(t, v) for t, v in self._sw_temp_history if now - t <= 600]
+        self._observe_cloud_coast(current_temp, now, lag_time_min)
         self._sw_long_history.append((now, current_temp))
         self._sw_long_history = [(t, v) for t, v in self._sw_long_history if now - t <= SW_I_WINDOW_SEC]
         if self._sw_device_on is False and self._sw_peak_temp is not None:
@@ -775,7 +816,11 @@ class TesyConvectorClimate(ClimateEntity):
         ramp_rate = 0.0
         if self._sw_device_on:
             ramp_rate = max(0.0, self.estimate_temp_trend(self._sw_temp_history, min_span_sec=20.0) or 0.0)
-        predicted_temp = current_temp + ramp_rate * lag_time_min
+        prediction_minutes = (
+            min(lag_time_min, self._sw_observed_coast_minutes)
+            if self._sw_observed_coast_minutes is not None else lag_time_min
+        )
+        predicted_temp = current_temp + ramp_rate * prediction_minutes
         self._sw_ramp_rate = ramp_rate
         self._sw_predicted_temp = predicted_temp
         self._sw_effective_off_threshold = effective_upper
@@ -788,20 +833,32 @@ class TesyConvectorClimate(ClimateEntity):
             current_temp < effective_upper and predicted_temp < effective_upper
             if self._sw_device_on else current_temp <= lower
         )
-        if desired_on == self._sw_device_on:
+        headroom = self._cloud_headroom(current_temp, lower, predicted_temp, desired_on, now)
+        device_target = (
+            min(math.ceil(setpoint) + headroom, math.floor(setpoint + 3), int(self._attr_max_temp))
+            if desired_on else int(self._attr_min_temp)
+        )
+        if desired_on:
+            headroom = max(0, device_target - math.ceil(setpoint))
+        same_phase = desired_on == self._sw_device_on
+        if same_phase and device_target == self._sw_applied_setpoint:
+            self._sw_headroom = headroom
             return
         if desired_on and self._sw_last_off_time is not None:
             if now - self._sw_last_off_time < min_off_sec:
                 return
-        if not desired_on and self._sw_device_on and self._sw_last_on_time is not None:
+        cloud = self._cloud_telemetry if self._get_options().get(CONF_CLOUD_TELEMETRY_ENABLED, False) else None
+        # With a live heating report, the room reaching target takes priority
+        # over the wear timer. Prediction still respects normal minimum times.
+        reached_target = cloud is not None and cloud.heating is True and current_temp >= setpoint
+        if not desired_on and self._sw_device_on and self._sw_last_on_time is not None and not reached_target:
             if now - self._sw_last_on_time < min_on_sec:
                 return
 
         # Keep the TCP connection alive by lowering the thermostat for OFF.
         # floor(target)-1 could still heat if the internal sensor reads colder
         # than the room sensor. Use the supported minimum, retaining low-temp
-        # firmware protection; ceil(target) remains the ON safety limiter.
-        device_target = math.ceil(setpoint) if desired_on else int(self._attr_min_temp)
+        # firmware protection. Live telemetry can justify bounded ON headroom.
         result = await self.convector.set_temperature(device_target, source="climate._run_sw_controller")
         if isinstance(result, dict) and "error" in result:
             raise RuntimeError(f"Could not apply SW phase: {result['error']}")
@@ -809,6 +866,17 @@ class TesyConvectorClimate(ClimateEntity):
             result = await self.convector.set_mode("heating", source="climate._run_sw_controller")
             if isinstance(result, dict) and "error" in result:
                 raise RuntimeError(f"Could not enable SW heating mode: {result['error']}")
+        self._sw_headroom = headroom
+        self._sw_applied_setpoint = device_target
+        self._sw_applied_at = now
+        self._sw_cloud_veto_count = 0
+        self._sw_cloud_veto_window_start = None
+        self._sw_blocked_since = None
+        self._sw_cloud_cutoff_eta = None
+        if same_phase:
+            # Correct the firmware ceiling without inventing another duty cycle
+            # or losing the room's warming trend and minimum-time accounting.
+            return
         cycle_completed = desired_on and self._sw_peak_temp is not None
         if desired_on:
             self._learn_coast_peak(hysteresis)
@@ -839,6 +907,168 @@ class TesyConvectorClimate(ClimateEntity):
         )
         self._update_hvac_action()
         self.async_write_ha_state()
+
+    def _observe_cloud_coast(self, current_temp, now, lag_limit):
+        """Estimate coast horizon from actual heating stops and room rise rate."""
+        cloud = self._cloud_telemetry if self._get_options().get(CONF_CLOUD_TELEMETRY_ENABLED, False) else None
+        heating = cloud.heating if cloud is not None else None
+        if heating is None:
+            self._sw_cloud_previous_heat = None
+            self._sw_cloud_coast = None
+            # A previously learned live-session estimate can be reused only
+            # while telemetry is present; stale periods use configured lag.
+            self._sw_observed_coast_minutes = None
+            self._sw_cloud_internal_history = []
+            self._sw_cloud_room_history = []
+            self._sw_cloud_internal_rise_rate = None
+            self._sw_cloud_internal_rate_lower = None
+            self._sw_cloud_cutoff_offset = None
+            self._sw_cloud_veto_count = 0
+            self._sw_cloud_veto_window_start = None
+            self._sw_cloud_cutoff_eta = None
+            self._sw_cloud_internal_coast = None
+            return
+        internal = cloud.temperature
+        # Preserve the pre-stop room ramp across software phase changes.
+        room_history = self._sw_cloud_room_history
+        room_history.append((now, current_temp))
+        room_history[:] = [(t, v) for t, v in room_history if now - t <= 300]
+        if internal is not None and cloud.age is not None:
+            reported_at = now - cloud.age
+            history = self._sw_cloud_internal_history
+            # Repeated HA polls of the same cloud report are not new samples.
+            if not history or reported_at - history[-1][0] >= 1:
+                history.append((reported_at, internal))
+            history[:] = [(t, v) for t, v in history if reported_at - t <= 300]
+            self._sw_cloud_internal_rise_rate = None
+            self._sw_cloud_internal_rate_lower = None
+            recent = [(t, v) for t, v in history if reported_at - t <= 120]
+            if len(recent) >= 3:
+                span = recent[-1][0] - recent[0][0]
+                rise = recent[-1][1] - recent[0][1]
+                # One 0.5 C step can be rounding alone. Require two steps
+                # over a minute, then subtract endpoint uncertainty from slope.
+                if span >= 60 and rise >= 2 * CLOUD_TEMPERATURE_STEP:
+                    self._sw_cloud_internal_rise_rate = self.estimate_temp_trend(recent, min_span_sec=60)
+                    self._sw_cloud_internal_rate_lower = max(0.0, 60 * (rise - CLOUD_TEMPERATURE_STEP) / span)
+        else:
+            self._sw_cloud_internal_history = []
+            self._sw_cloud_internal_rise_rate = None
+            self._sw_cloud_internal_rate_lower = None
+        self._sw_cloud_cutoff_eta = None
+        if self._sw_cloud_previous_heat is True and heating is False:
+            rate = max(0.0, self.estimate_temp_trend(room_history, min_span_sec=20) or 0.0)
+            self._sw_cloud_coast = (now, current_temp, current_temp, rate)
+            self._sw_cloud_internal_coast = (
+                (now, internal, internal, now) if internal is not None else None
+            )
+            # Learn only firmware vetoes during requested ON, with a report
+            # newer than our command. Software OFF is not a thermostat cutoff.
+            if (
+                internal is not None and self._sw_device_on is True
+                and self._sw_applied_at is not None and cloud.age is not None
+                and now - cloud.age > self._sw_applied_at
+                and abs(internal - self._sw_applied_setpoint) <= 1
+            ):
+                offset = internal - self._sw_applied_setpoint
+                previous = self._sw_cloud_cutoff_offset
+                self._sw_cloud_cutoff_offset = offset if previous is None else 0.8 * previous + 0.2 * offset
+                if self._sw_cloud_veto_window_start is None or now - self._sw_cloud_veto_window_start > 300:
+                    self._sw_cloud_veto_window_start = now
+                    self._sw_cloud_veto_count = 0
+                self._sw_cloud_veto_count += 1
+        internal_rate = self._sw_cloud_internal_rise_rate
+        internal_coast = self._sw_cloud_internal_coast
+        if internal_coast is not None:
+            stopped_at, stopped_temp, peak, peaked_at = internal_coast
+            if internal is None:
+                self._sw_cloud_internal_coast = None
+            else:
+                if internal > peak:
+                    peak, peaked_at = internal, now
+                if now - stopped_at >= 30 and heating is False and peak - internal >= CLOUD_TEMPERATURE_STEP:
+                    self._sw_internal_coast_rise = peak - stopped_temp
+                    self._sw_internal_coast_seconds = peaked_at - stopped_at
+                    self._sw_cloud_internal_coast = None
+                elif heating is True or now - stopped_at > 600:
+                    self._sw_cloud_internal_coast = None
+                else:
+                    self._sw_cloud_internal_coast = (stopped_at, stopped_temp, peak, peaked_at)
+        if (
+            heating is True and internal is not None and internal_rate is not None
+            and internal_rate >= 0.02 and self._sw_cloud_cutoff_offset is not None
+            and self._sw_device_on is True and self._sw_applied_setpoint is not None
+            and self._sw_applied_at is not None and cloud.age is not None
+            and now - cloud.age > self._sw_applied_at
+        ):
+            cutoff = self._sw_applied_setpoint + self._sw_cloud_cutoff_offset
+            # Both cutoff and current reading are rounded +/- 0.25 C.
+            # Use the latest plausible cutoff and slowest plausible rise:
+            # an apparent threshold crossing alone must not trigger a boost.
+            lower_rate = self._sw_cloud_internal_rate_lower
+            if lower_rate is not None and lower_rate >= 0.02:
+                gap = max(0.0, cutoff - internal + CLOUD_TEMPERATURE_STEP)
+                self._sw_cloud_cutoff_eta = 60 * gap / lower_rate
+        coast = self._sw_cloud_coast
+        if coast is not None:
+            stopped_at, stopped_temp, peak, rate = coast
+            peak = max(peak, current_temp)
+            if now - stopped_at >= 30 and heating is False and current_temp < peak - 0.02:
+                # Ignore nearly flat ramps: dividing by them amplifies noise.
+                if rate >= 0.02 and peak - stopped_temp >= 0.02:
+                    measured = max(0.0, min(lag_limit, (peak - stopped_temp) / rate))
+                    previous = self._sw_observed_coast_minutes
+                    # A single noisy coast must not sharply shorten prediction.
+                    previous = lag_limit if previous is None else previous
+                    self._sw_observed_coast_minutes = 0.8 * previous + 0.2 * measured
+                self._sw_cloud_coast = None
+            elif heating is True or now - stopped_at > 600:
+                self._sw_cloud_coast = None
+            else:
+                self._sw_cloud_coast = (stopped_at, stopped_temp, peak, rate)
+        self._sw_cloud_previous_heat = heating
+
+    def _cloud_headroom(self, current_temp, lower, predicted_temp, desired_on, now):
+        """Permit bounded firmware headroom only after sustained live vetoes."""
+        cloud = self._cloud_telemetry if self._get_options().get(CONF_CLOUD_TELEMETRY_ENABLED, False) else None
+        if cloud is None or cloud.heating is None:
+            self._sw_blocked_since = None
+            return 0
+        eligible = (
+            desired_on and self._sw_device_on is True
+            and current_temp < lower and predicted_temp < lower and self._sw_applied_at is not None
+            and cloud.age is not None and now - cloud.age > self._sw_applied_at
+        )
+        # Quantized temperature may hide the rise rate of a short thermostat
+        # cycle. Three observed vetoes are stronger evidence than one step.
+        if (
+            eligible and cloud.heating is False and self._sw_cloud_veto_count >= 3
+            and self._sw_cloud_veto_window_start is not None
+            and now - self._sw_cloud_veto_window_start <= 300
+            and now - self._sw_applied_at >= 120
+        ):
+            self._sw_blocked_since = None
+            return min(3, self._sw_headroom + 1)
+        # After observing a real firmware cutoff, its internal rise rate can
+        # justify one step just before another veto, rather than waiting cold.
+        if (
+            eligible and cloud.heating is True and self._sw_cloud_cutoff_eta is not None
+            and self._sw_cloud_cutoff_eta <= 30 and now - self._sw_applied_at >= 120
+        ):
+            self._sw_blocked_since = None
+            return min(3, self._sw_headroom + 1)
+        blocked = eligible and cloud.heating is False and (
+            cloud.temperature is None
+            or cloud.temperature - CLOUD_TEMPERATURE_STEP / 2 >= self._sw_applied_setpoint - 0.5
+        ) and self._sw_cloud_internal_coast is None
+        if not blocked:
+            self._sw_blocked_since = None
+            return self._sw_headroom
+        if self._sw_blocked_since is None:
+            self._sw_blocked_since = now
+        if now - self._sw_blocked_since >= 60 and now - self._sw_applied_at >= 120:
+            return min(3, self._sw_headroom + 1)
+        return self._sw_headroom
 
     def _get_external_temp(
         self,
@@ -1135,6 +1365,18 @@ class TesyConvectorClimate(ClimateEntity):
                 if self._external_raw_temp is not None and self._target_temp is not None else None
             ),
             "sw_heat_requested": self._sw_device_on,
+            "sw_firmware_headroom": self._sw_headroom,
+            "sw_firmware_setpoint": self._sw_applied_setpoint,
+            "sw_observed_coast_minutes": self._sw_observed_coast_minutes,
+            "sw_cloud_internal_rise_rate": self._sw_cloud_internal_rise_rate,
+            "sw_firmware_cutoff_temperature": (
+                self._sw_applied_setpoint + self._sw_cloud_cutoff_offset
+                if self._sw_device_on is True and self._sw_applied_setpoint is not None
+                and self._sw_cloud_cutoff_offset is not None else None
+            ),
+            "sw_firmware_cutoff_eta_sec": self._sw_cloud_cutoff_eta,
+            "sw_internal_coast_rise": self._sw_internal_coast_rise,
+            "sw_internal_coast_seconds": self._sw_internal_coast_seconds,
             "firmware_limit_estimated": self._sw_firmware_limit_estimated,
             "firmware_fallback_active": self._sw_fallback_active,
             "overshoot_correction": round(self._sw_overshoot_correction, 3),

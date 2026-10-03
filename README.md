@@ -41,7 +41,8 @@ Duty cycle remains a diagnostic; heating decisions continue to use live feedback
 Entity attributes expose sensor validity and age, filtered temperature,
 controller state, firmware fallback, prediction, effective cutoff, learned
 overshoot correction, slow average correction, and completed-cycle duty.
-Software ON retains `ceil(target)` as the device thermostat safety limit;
+Software ON starts with `ceil(target)` as the device thermostat limit;
+fresh cloud telemetry can justify bounded headroom as described below.
 software OFF uses the supported minimum setpoint of 10 °C to preserve the device
 connection without the firmware continuing to heat a normally warm room.
 
@@ -75,6 +76,10 @@ recorder:
 
 Merge these filters into an existing `recorder` section rather than creating a
 second one. Newly registered diagnostic entities use this naming pattern.
+This includes all cloud temperature, firmware cutoff, headroom, and heat-trail
+sensors; adding those diagnostics requires no extra Recorder filters. None of
+these sensors declares a statistics state class, and their matching climate
+attributes are also excluded from recording.
 Existing or manually renamed diagnostic entities retain their registry IDs:
 add those exact IDs under `recorder.exclude.entities` instead, or rename them to
 match the pattern. Explicit Recorder include rules can override the exclusion;
@@ -98,7 +103,8 @@ results, limitations, and how to compare software control with firmware in a roo
 An optional, experimental connection can show the heater's reported heating
 activity separately from the software heat request. It uses the MyTESY Android
 app's cloud discovery and MQTT protocol; it does not publish heater commands.
-This protocol is unofficial and has not yet been verified with a live account.
+This protocol is unofficial. A user has verified the connection on a live heater;
+the adaptive control still needs comparison over complete heating cycles.
 
 In the integration's **Configure** options, enable **Use MyTESY cloud heating
 telemetry**, sign in to MyTESY, then select the same physical heater. The account
@@ -117,9 +123,35 @@ the selected external room sensor remains the controller's feedback.
 While enabled, fresh reports supply the climate Heating/Idle indicator. Missing
 reports, disconnects, and reports older than 180 seconds make the heating
 indicator unknown. Local OFF/window inhibition still displays Off. Unknown
-telemetry does not change the controller's requested phase or firmware fallback.
+telemetry restores the normal ON ceiling and configured prediction horizon.
 Cloud connectivity alone does not prove a fresh heating report. Requested duty
 cycle remains a record of commands, not element runtime or measured power.
+
+With software control and a valid external sensor, heating transitions now
+anchor learning to when the device reports the element stopped. Diagnostics
+show the internal cloud temperature's rise rate, its extra rise after stopping,
+and the time to its observed peak. Separately, the room's rise after actual
+stopping gradually tunes the predictive coast horizon, bounded by the configured
+lag time. Interrupted coasts and stale telemetry are discarded.
+
+The controller also estimates firmware cutoff temperature and time to cutoff
+from internal cloud temperature trends and observed thermostat stops. When the
+room and its predicted coast remain below the heating band, a sustained firmware
+veto can increase the ON setpoint in 1°C steps, no faster than every 120 seconds.
+After a learned cutoff, its internal rise rate can anticipate another veto.
+Cloud temperature is rounded in 0.5°C steps: rate estimation requires at least
+two steps over a minute, and cutoff forecasts allow ±0.25°C per reading.
+Plateaus or single-step flicker leave the rate/forecast unknown. Three confirmed
+firmware stops within five minutes can identify short cycling even when the
+rounded temperature does not resolve a slope; the same headroom limits apply.
+The firmware setpoint never exceeds room target + 3°C or the device's 30°C limit.
+The external sensor still controls OFF; a fresh heating report lets reaching the
+room target override the minimum ON timer. No MQTT control commands are sent.
+
+New diagnostic sensors expose the firmware headroom and applied setpoint,
+estimated cutoff temperature/time, internal rise rate, internal heat trail, and
+learned room coast horizon. These measurements and headroom are session-local;
+after restart, stale telemetry, or loss of room feedback, adaptation starts afresh.
 
 This uses a separate secure WebSocket MQTT connection and does not require or
 change Home Assistant's own MQTT broker configuration. Reconnects back off to

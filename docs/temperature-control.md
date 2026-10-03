@@ -43,11 +43,11 @@ modulation. It cannot demonstrate savings or prove better control than firmware.
 
 ## The firmware remains part of the control loop
 
-Software ON raises the firmware setpoint to `ceil(target)`. If the internal sensor
+Software ON initially raises the firmware setpoint to `ceil(target)`. If the internal sensor
 already reaches that value, the firmware may stop the element even while the
 external sensor remains below target. Raising the software duty cycle will not
-overcome this safety limiter. A large persistent difference between internal and
-room sensors needs investigation and appropriate sensor correction.
+overcome this limiter. Optional cloud assistance can instead adjust the firmware
+ceiling within bounded limits, using actual heating and temperature feedback.
 
 Software OFF now lowers the setpoint to the supported minimum of 10 °C to keep
 the device connection alive. The previous `floor(target) - 1` value could still
@@ -57,11 +57,49 @@ firmware can still heat at very low temperatures. Neither requested duty nor
 `hvac_action` is an independently measured power or relay signal.
 
 Optional MyTESY cloud telemetry can replace the climate's requested/estimated
-Heating/Idle indicator with a fresh device-reported heating flag. It does not
-change the software phase, learning, or room feedback. The device-reported flag
+Heating/Idle indicator with a fresh device-reported heating flag. It also anchors
+thermal coast observations to actual reported stops. The device-reported flag
 is not an independent electricity measurement. With telemetry enabled but
 missing, stale, or disconnected, the action is unknown rather than inferred from
-the request. This experimental protocol still needs a live-account check.
+the request. Cloud connectivity has been verified on a user's heater; control
+improvements still need a comparison over full live heating cycles.
+
+The internal cloud temperature trend estimates the firmware's cutoff threshold
+and time to reach it after observing a thermostat stop during requested ON.
+After reported heating stops, internal temperature peak rise and time to peak
+are tracked separately from the external room's coast. Only completed room
+coasts with a positive pre-stop ramp update prediction: extra room rise divided
+by its pre-stop rise rate estimates a coast horizon, blended 20% into the prior
+horizon and capped at the configured lag. Coasts interrupted by heating restart,
+telemetry loss, or missing room feedback are discarded, not extrapolated.
+
+When both the room and its predicted coast remain below the ON threshold,
+sustained fresh OFF reports can justify another 1°C of firmware headroom after
+60 seconds of confirmed veto and at least 120 seconds since the last command.
+An unfinished internal coast delays this adjustment. Once a firmware cutoff is
+learned, a rising internal cloud temperature with an estimated cutoff within
+30 seconds can justify the same bounded step before the next veto. Headroom
+does not bypass firmware protections: the setpoint is capped at target + 3°C
+and 30°C. It does raise the retained firmware target if HA stops during ON.
+Stale cloud feedback restores the ordinary ceiling on the next successful local
+poll; invalid room feedback invokes the existing firmware fallback. None of
+these new estimates or headroom values are persisted across restart.
+
+Cloud temperature has 0.5°C resolution, treated as ±0.25°C uncertainty per
+reading. Internal rate estimation requires three or more distinct reports over
+at least 60 seconds and a net rise of at least 1°C. A single rounded step or
+plateau yields an unknown rate. Cutoff ETA uses the slowest rise consistent with
+the endpoint uncertainty and a 0.5°C allowance between current temperature and
+learned cutoff. Internal coast peak completion requires a displayed fall of at
+least 0.5°C; its rise and time to peak are approximate observations. Room-coast
+learning continues to use the external sensor's own resolution. When short
+firmware cycles never span two cloud temperature steps, three observed heating
+stops within five minutes can justify bounded headroom after the existing
+120-second command interval, without relying on a resolved temperature slope.
+
+A synthetic biased-thermostat test checks that cloud assistance reduces room
+undershoot while bounding peaks. It is an illustrative model, not validation of
+the proprietary thermostat or proof of improved comfort on a real heater.
 
 Firmware-only control continues without Home Assistant or a network connection.
 Software control depends on both. If Home Assistant stops during software OFF,

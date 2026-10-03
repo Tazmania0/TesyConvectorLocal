@@ -5,6 +5,7 @@ CONF_CLOUD_TELEMETRY_ENABLED = "cloud_telemetry_enabled"
 CONF_CLOUD_TELEMETRY_RECONFIGURE = "cloud_telemetry_reconfigure"
 CONF_CLOUD_TELEMETRY = "cloud_telemetry"
 CLOUD_TELEMETRY_MAX_AGE_SEC = 180
+CLOUD_TEMPERATURE_STEP = 0.5  # rounded telemetry: +/- 0.25 C per reading
 
 # FIX: binary_sensor was missing — must match _PLATFORMS in __init__.py.
 # PLATFORMS is kept here for reference but __init__.py uses its own _PLATFORMS list

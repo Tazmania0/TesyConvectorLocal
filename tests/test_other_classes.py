@@ -313,7 +313,7 @@ def test_diagnostic_sensor_setup_groups_enabled_entities_with_heater():
     hass = types.SimpleNamespace(data={const.DOMAIN: {entry.entry_id: {'climate_entity': climate}}})
     added = []
     asyncio.run(sensor.async_setup_entry(hass, entry, added.extend))
-    assert len(added) == 14
+    assert len(added) == 22
     assert len({item._attr_unique_id for item in added}) == len(added)
     for item in added:
         assert item._attr_entity_category == 'diagnostic'

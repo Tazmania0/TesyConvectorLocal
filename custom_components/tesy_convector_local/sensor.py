@@ -28,9 +28,45 @@ _DIAGNOSTIC_ICONS = {
 
 DIAGNOSTIC_SENSORS = (
     SensorEntityDescription(
-        key="cloud_current_temp", name="Cloud device temperature",
+        key="sw_internal_coast_rise", name="Internal temperature rise after heating stops",
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        device_class=_DELTA_CLASS, suggested_display_precision=2,
+    ),
+    SensorEntityDescription(
+        key="sw_internal_coast_seconds", name="Internal temperature time to coast peak",
+        native_unit_of_measurement="s", suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="sw_cloud_internal_rise_rate", name="Cloud internal temperature rise rate",
+        native_unit_of_measurement="°C/min", suggested_display_precision=3,
+    ),
+    SensorEntityDescription(
+        key="sw_firmware_cutoff_temperature", name="Estimated firmware cutoff temperature",
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
         device_class=SensorDeviceClass.TEMPERATURE, suggested_display_precision=2,
+    ),
+    SensorEntityDescription(
+        key="sw_firmware_cutoff_eta_sec", name="Estimated time to firmware cutoff",
+        native_unit_of_measurement="s", suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="sw_firmware_headroom", name="Firmware heating headroom",
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        device_class=_DELTA_CLASS, suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="sw_firmware_setpoint", name="Controller firmware setpoint",
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        device_class=SensorDeviceClass.TEMPERATURE, suggested_display_precision=0,
+    ),
+    SensorEntityDescription(
+        key="sw_observed_coast_minutes", name="Learned thermal coast horizon",
+        native_unit_of_measurement="min", suggested_display_precision=2,
+    ),
+    SensorEntityDescription(
+        key="cloud_current_temp", name="Cloud device temperature",
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        device_class=SensorDeviceClass.TEMPERATURE, suggested_display_precision=1,
     ),
     SensorEntityDescription(
         key="cloud_telemetry_age_sec", name="Cloud heating report age",

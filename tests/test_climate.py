@@ -205,6 +205,253 @@ def test_repeated_poll_failures_mark_unavailable_and_back_off(entity):
     assert entity._comm_failures == 0
 
 
+def cloud_feedback(entity, heating=False, temperature=22.0, age=0):
+    entity._config_entry.options[const.CONF_CLOUD_TELEMETRY_ENABLED] = True
+    entity._cloud_telemetry = types.SimpleNamespace(
+        heating=heating, temperature=temperature, age=age, connected=True,
+    )
+    return entity._cloud_telemetry
+
+
+def test_live_firmware_veto_raises_bounded_headroom_without_new_phase(entity):
+    cloud_feedback(entity)
+    run(entity, 21.0)
+    started = entity._sw_last_on_time
+    run(entity, 21.0, dt=60)
+    assert entity.convector.setpoint == 22
+    run(entity, 21.0, dt=60)
+    assert entity.convector.setpoint == 23
+    assert entity._sw_headroom == 1
+    assert entity._sw_last_on_time == started
+    assert entity._sw_duty_cycles == []
+    for internal in (23, 24, 25, 25):
+        entity._cloud_telemetry.temperature = internal
+        run(entity, 21.0, dt=60)
+        run(entity, 21.0, dt=60)
+    assert entity.convector.setpoint == 25
+    assert entity._sw_headroom == 3
+
+
+def test_lost_cloud_restores_normal_ceiling_in_same_phase(entity):
+    test_live_firmware_veto_raises_bounded_headroom_without_new_phase(entity)
+    entity._cloud_telemetry.heating = None
+    run(entity, 21.0, dt=10)
+    assert entity.convector.setpoint == 22
+    assert entity._sw_headroom == 0
+
+
+def test_warm_room_trend_delays_headroom_boost(entity):
+    cloud_feedback(entity)
+    run(entity, 21.0, lag_time_min=6)
+    for temp in (21.1, 21.2, 21.3):
+        run(entity, temp, dt=30, lag_time_min=6)
+    assert entity._sw_headroom == 0
+
+
+def test_old_report_cannot_raise_ceiling(entity):
+    cloud = cloud_feedback(entity)
+    run(entity, 21.0)
+    for _ in range(5):
+        cloud.age += 60
+        run(entity, 21.0, dt=60)
+    assert entity._sw_headroom == 0
+
+
+def test_cloud_cutoff_uses_internal_rate_and_learns_firmware_threshold(entity):
+    cloud = cloud_feedback(entity, heating=True, temperature=21.0)
+    run(entity, 21.0)
+    cloud.temperature = 21.5
+    run(entity, 21.0, dt=30)
+    cloud.temperature = 22.0
+    run(entity, 21.0, dt=30)
+    assert entity._sw_cloud_internal_rise_rate == pytest.approx(1.0)
+    cloud.heating = False
+    cloud.temperature = 22.0
+    run(entity, 21.0, dt=30)
+    assert entity._sw_cloud_cutoff_offset == pytest.approx(0)
+    cloud.heating = True
+    cloud.temperature = 22.5
+    run(entity, 21.0, dt=30)
+    assert entity._sw_headroom == 1
+    assert entity.convector.setpoint == 23
+
+
+def test_missing_internal_temp_does_not_invent_cutoff_forecast(entity):
+    cloud = cloud_feedback(entity, heating=True, temperature=None)
+    run(entity, 21.0)
+    cloud.heating = False
+    run(entity, 21.0, dt=30)
+    assert entity._sw_cloud_cutoff_offset is None
+    assert entity._sw_cloud_cutoff_eta is None
+
+
+@pytest.mark.parametrize('readings', [
+    [22.0, 22.0, 22.5, 22.5, 22.5],
+    [22.0, 22.5, 22.0, 22.5, 22.0],
+    [22.0, 22.0, 22.0, 22.0, 22.0],
+])
+def test_one_cloud_rounding_step_or_plateau_does_not_trigger_forecast(entity, readings):
+    cloud = cloud_feedback(entity, heating=True, temperature=readings[0])
+    run(entity, 21.0)
+    entity._sw_cloud_cutoff_offset = 0.0
+    for internal in readings[1:]:
+        cloud.temperature = internal
+        run(entity, 21.0, dt=30)
+        assert entity._sw_cloud_internal_rise_rate is None
+        assert entity._sw_cloud_cutoff_eta is None
+        assert entity._sw_headroom == 0
+
+
+def test_cutoff_forecast_includes_rounding_uncertainty(entity):
+    cloud = cloud_feedback(entity, heating=True, temperature=21.0)
+    run(entity, 21.0)
+    entity._sw_cloud_cutoff_offset = 0.0
+    cloud.temperature = 21.5
+    run(entity, 21.0, dt=30)
+    cloud.temperature = 22.0
+    run(entity, 21.0, dt=30)
+    # Equal displayed temperatures still leave endpoint rounding uncertainty.
+    assert entity._sw_cloud_cutoff_eta == pytest.approx(60.0)
+    assert entity._sw_headroom == 0
+
+
+def test_repeated_actual_vetoes_can_adapt_without_resolved_internal_rate(entity):
+    cloud = cloud_feedback(entity, heating=True, temperature=21.5)
+    run(entity, 21.0)
+    for _ in range(4):
+        cloud.heating = False
+        cloud.temperature = 22.0
+        run(entity, 21.0, dt=20)
+        cloud.heating = True
+        cloud.temperature = 21.5
+        run(entity, 21.0, dt=20)
+    assert entity._sw_cloud_internal_rise_rate is None
+    assert entity._sw_headroom == 1
+    assert entity.convector.setpoint == 23
+
+
+def test_live_target_cutoff_overrides_minimum_on_timer(entity):
+    cloud_feedback(entity, heating=True)
+    run(entity, 21.6)
+    run(entity, 22.0, dt=10)
+    assert entity._sw_device_on is False
+    assert entity.convector.setpoint == 10
+
+
+def test_cloud_room_coast_learning_uses_actual_stop_and_positive_ramp(entity):
+    cloud = cloud_feedback(entity, heating=True)
+    run(entity, 21.0, lag_time_min=6)
+    run(entity, 21.1, dt=60, lag_time_min=6)
+    cloud.heating = False
+    run(entity, 21.2, dt=60, lag_time_min=6)
+    run(entity, 21.3, dt=60, lag_time_min=6)
+    run(entity, 21.35, dt=60, lag_time_min=6)
+    run(entity, 21.32, dt=60, lag_time_min=6)
+    assert entity._sw_observed_coast_minutes == pytest.approx(5.1)
+    entity._cloud_telemetry.heating = None
+    run(entity, 21.32, dt=10, lag_time_min=6)
+    assert entity._sw_observed_coast_minutes is None
+
+
+def test_internal_heat_trail_tracks_peak_after_actual_stop(entity):
+    cloud = cloud_feedback(entity, heating=True, temperature=21.0)
+    run(entity, 21.0)
+    cloud.heating = False
+    cloud.temperature = 22.0
+    run(entity, 21.0, dt=30)
+    cloud.temperature = 22.5
+    run(entity, 21.0, dt=30)
+    cloud.temperature = 23.0
+    run(entity, 21.0, dt=30)
+    cloud.temperature = 22.5
+    run(entity, 21.0, dt=30)
+    assert entity._sw_internal_coast_rise == pytest.approx(1.0)
+    assert entity._sw_internal_coast_seconds == 60
+
+
+def test_cloud_resumption_discards_unfinished_heat_trail(entity):
+    cloud = cloud_feedback(entity, heating=True, temperature=21.0)
+    run(entity, 21.0)
+    run(entity, 21.1, dt=30)
+    cloud.heating = False
+    run(entity, 21.2, dt=30)
+    cloud.temperature = 22.4
+    run(entity, 21.3, dt=30)
+    cloud.heating = True
+    run(entity, 21.4, dt=30)
+    assert entity._sw_cloud_coast is None
+    assert entity._sw_cloud_internal_coast is None
+    assert entity._sw_observed_coast_minutes is None
+    assert entity._sw_internal_coast_rise is None
+
+
+def test_raising_firmware_ceiling_does_not_replace_room_target_on_poll(entity):
+    cloud = cloud_feedback(entity)
+    poll(entity, 21.0)
+    for _ in range(10):
+        cloud.temperature = entity.convector.setpoint
+        poll(entity, 21.0, dt=60)
+    assert entity._target_temp == 22.0
+    assert entity.convector.setpoint == 25
+
+
+def test_failed_headroom_write_does_not_claim_an_applied_adjustment(entity):
+    cloud_feedback(entity)
+    run(entity, 21.0)
+    run(entity, 21.0, dt=60)
+    entity.convector.set_temperature = AsyncMock(return_value={'error': 'timeout'})
+    with pytest.raises(RuntimeError):
+        run(entity, 21.0, dt=60)
+    assert entity._sw_headroom == 0
+    assert entity._sw_applied_setpoint == 22
+
+
+@pytest.mark.parametrize('target', [22.5, 29.0, 30.0])
+def test_headroom_obeys_room_relative_and_device_limits(entity, target):
+    entity._target_temp = target
+    cloud = cloud_feedback(entity, temperature=target)
+    run(entity, target - 1)
+    for _ in range(10):
+        cloud.temperature = entity.convector.setpoint
+        run(entity, target - 1, dt=60)
+    assert entity.convector.setpoint <= min(30, target + 3)
+
+
+async def simulate_firmware_limited_room(entity, use_cloud):
+    """Illustrative biased thermostat with delayed internal and room heating."""
+    room, internal, output = 20.0, 21.5, 0.0
+    heating = False
+    cloud = cloud_feedback(entity) if use_cloud else None
+    settled = []
+    for now in range(0, 14400, 10):
+        entity.clock = now
+        if cloud is not None:
+            cloud.heating = heating
+            cloud.temperature = round(internal * 2) / 2
+        await entity._run_sw_controller(room, 60, 60, 0.3, 6, 0)
+        ceiling = entity.convector.setpoint
+        for _ in range(10):
+            if internal >= ceiling:
+                heating = False
+            elif internal <= ceiling - 0.3:
+                heating = True
+            output += (float(heating) - output) / 90
+            room += 0.004 * output - 0.00008 * (room - 10)
+            internal += (room + 1.5 + 2.2 * float(heating) - internal) / 40
+        if now >= 10800:
+            settled.append(room)
+    return max(settled), sum(abs(t - 22) for t in settled) / len(settled)
+
+
+def test_cloud_assistance_reduces_undershoot_in_biased_firmware_model(entity):
+    baseline_peak, baseline_error = asyncio.run(simulate_firmware_limited_room(entity, False))
+    entity._reset_sw_controller()
+    assisted_peak, assisted_error = asyncio.run(simulate_firmware_limited_room(entity, True))
+    assert assisted_error < baseline_error
+    assert assisted_error <= 0.4
+    assert assisted_peak <= 22.3
+
+
 def test_initial_idle_enforces_minimum_off(entity):
     run(entity, 21.8)
     assert entity._sw_device_on is False
