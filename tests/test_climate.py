@@ -1321,12 +1321,98 @@ def test_saved_learning_rejected_for_changed_settings(entity, setting, value):
     assert entity._sw_duty_cycles == []
 
 
-def test_saved_learning_rejected_for_changed_target(entity):
+def test_saved_learning_survives_changed_target_and_legacy_context(entity):
     entity._sw_restore_pending = saved_learning(entity)
+    entity._sw_restore_pending['context']['target'] = 22.0
     entity._target_temp = 23.0
     run(entity, 23.0)
-    assert entity._sw_overshoot_correction == 0
-    assert entity._sw_duty_cycles == []
+    assert entity._sw_overshoot_correction == pytest.approx(0.09)
+    assert entity._sw_duty_cycles == [(120, 60), (60, 120)]
+
+
+@pytest.mark.parametrize('target,expected', [(22.5, 25), (26.0, 28), (29.0, 30)])
+def test_target_increase_retains_thermal_learning_and_bounds_headroom(entity, target, expected):
+    cloud_feedback(entity, heating=True, temperature=23.0)
+    poll(entity, 21.0)
+    entity._sw_headroom = 2
+    entity._sw_applied_setpoint = 24
+    entity.convector.setpoint = 24
+    entity._sw_observed_coast_minutes = 4
+    entity._sw_cloud_cutoff_offset = -0.25
+    entity._sw_overshoot_correction = 0.08
+    entity._sw_duty_cycles = [(120, 60)]
+    entity._sw_duty_pct = 67
+    entity._sw_peak_temp = 22.2
+    old_history = list(entity._sw_temp_history)
+    old_on_time = entity._sw_last_on_time
+    asyncio.run(entity.async_set_temperature(temperature=target))
+    assert entity.convector.setpoint == expected
+    assert entity._sw_headroom == expected - int(target + 0.999)
+    assert entity._sw_observed_coast_minutes == 4
+    assert entity._sw_cloud_cutoff_offset == -0.25
+    assert entity._sw_overshoot_correction == 0.08
+    assert entity._sw_duty_pct == 67
+    assert entity._sw_duty_cycles == [(120, 60)]
+    assert entity._sw_temp_history[:len(old_history)] == old_history
+    assert entity._sw_last_on_time == old_on_time
+    assert entity._sw_peak_temp is None
+    assert entity._sw_long_history == [(entity.clock, 21.0)]
+
+
+def test_large_target_drop_stops_actual_heating_without_discarding_model(entity):
+    cloud_feedback(entity, heating=True, temperature=27.0)
+    entity._target_temp = 26
+    poll(entity, 22.0)
+    entity._sw_headroom = 2
+    entity._sw_observed_coast_minutes = 4
+    asyncio.run(entity.async_set_temperature(temperature=16.0))
+    assert entity._sw_device_on is False
+    assert entity.convector.setpoint == 10
+    assert entity._sw_observed_coast_minutes == 4
+
+
+def test_daily_schedule_does_not_restart_learning(entity):
+    cloud_feedback(entity, heating=True, temperature=23.0)
+    poll(entity, 20.0)
+    entity._sw_headroom = 2
+    entity._sw_observed_coast_minutes = 4
+    entity._sw_cloud_cutoff_offset = 0.0
+    entity._sw_overshoot_correction = 0.06
+    entity._sw_duty_cycles = [(120, 60)]
+    for target in [22.5, 23.0, 22.0, 23.5, 22.5]:
+        entity.clock += 3600
+        entity.sensor = sensor(20.0)
+        asyncio.run(entity.async_set_temperature(temperature=target))
+        assert entity._sw_observed_coast_minutes == 4
+        assert entity._sw_overshoot_correction == 0.06
+        assert entity._sw_duty_cycles == [(120, 60)]
+        assert entity._sw_temp_history
+
+
+def test_same_target_does_not_reset_or_write(entity):
+    poll(entity, 21.0)
+    entity._sw_peak_temp = 22.1
+    old_calls = list(entity.convector.calls)
+    asyncio.run(entity.async_set_temperature(temperature=22.0))
+    assert entity._sw_peak_temp == 22.1
+    assert entity.convector.calls == old_calls
+
+
+def test_target_change_keeps_minimum_off_guard(entity):
+    poll(entity, 22.0)
+    entity.sensor = sensor(21.0)
+    old_off_time = entity._sw_last_off_time
+    asyncio.run(entity.async_set_temperature(temperature=23.0))
+    assert entity._sw_device_on is False
+    assert entity.convector.setpoint == 10
+    assert entity._sw_last_off_time == old_off_time
+
+
+def test_software_target_change_while_off_does_not_heat(entity):
+    entity._hvac_mode = HVACMode.OFF
+    asyncio.run(entity.async_set_temperature(temperature=26.0))
+    assert entity.target_temperature == 26
+    assert entity.convector.calls == []
 
 
 @pytest.mark.parametrize('bad_value', [

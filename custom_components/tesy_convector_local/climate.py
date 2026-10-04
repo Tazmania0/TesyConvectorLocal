@@ -756,11 +756,10 @@ class TesyConvectorClimate(ClimateEntity):
     # ------------------------------------------------------------------
 
     def _sw_learning_context(self) -> dict:
-        """Learning is specific to the room sensor, target, and control tuning."""
+        """Thermal learning follows the room sensor and control tuning."""
         options = self._get_options()
         return {
             "sensor": options.get(CONF_TEMPERATURE_ENTITY),
-            "target": self._target_temp,
             "hysteresis": float(options.get(CONF_SW_HYSTERESIS, DEFAULT_SW_HYSTERESIS)),
             "lag": float(options.get(CONF_SW_LAG_TIME, DEFAULT_SW_LAG_TIME)),
             "ema": float(options.get(CONF_SW_EMA_ALPHA, DEFAULT_SW_EMA_ALPHA)),
@@ -779,7 +778,12 @@ class TesyConvectorClimate(ClimateEntity):
         if saved is None:
             return
         context = self._sw_learning_context()
-        if not isinstance(saved, dict) or saved.get("context") != context:
+        saved_context = saved.get("context") if isinstance(saved, dict) else None
+        # Older storage included target. Scheduled target changes must not
+        # invalidate otherwise compatible thermal learning.
+        if isinstance(saved_context, dict):
+            saved_context = {key: value for key, value in saved_context.items() if key != "target"}
+        if saved_context != context:
             _LOGGER.debug("SW controller: saved learning does not match current settings")
             return
         try:
@@ -1653,21 +1657,26 @@ class TesyConvectorClimate(ClimateEntity):
 
         # ── HEAT mode, sw-control ON ─────────────────────────────────────────
         if sw_control:
+            if self._target_temp == temp:
+                return
             self._target_temp = temp
             self._persist_setpoint(temp)
-            self._reset_sw_controller()
+            # Retain physical trends, cloud cutoff/coast learning, headroom,
+            # completed duty samples and phase timers across schedule changes.
+            # A mean/overshoot measured against the previous target must not
+            # be credited to the new target, however.
+            self._sw_long_history = []
+            self._sw_i_correction = None
+            self._sw_peak_temp = None
             if self._sw_fallback_active:
                 await self._set_firmware_target()
                 return
-            # Safety setpoint: ceil(target) so the device thermostat cuts off
-            # just above the real target if HA ever loses control.
-            safety_setpoint = math.ceil(temp)   # e.g. 20.5→21, 20.0→20
-            _LOGGER.debug(
-                "SW ctrl: setpoint %.1f°C -> device setTemp=%d (safety backstop)",
-                temp, safety_setpoint,
-            )
-            await self.convector.set_temperature(safety_setpoint, source="climate.async_set_temperature")
-            await asyncio.sleep(0.1)
+            if self._hvac_mode == HVACMode.HEAT:
+                # Reevaluate with fresh status and room feedback immediately.
+                # The usual controller clamps carried headroom to the new
+                # target + 3 C / device maximum and respects phase protection.
+                await self.async_update()
+            self.async_write_ha_state()
             return
 
         # ── HEAT mode, sw-control OFF ────────────────────────────────────────

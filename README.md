@@ -53,8 +53,17 @@ source is used and why a reading was rejected, and are excluded from recording.
 The learned overshoot correction and last five completed duty-cycle samples are
 saved in Home Assistant storage after each completed heating cycle. They survive
 restarts and are restored once fresh sensor feedback is available, provided the
-sensor, target, and tuning settings still match. The heater phase, timers, EMA,
+sensor and tuning settings still match. The heater phase, timers, EMA,
 temperature histories, and unfinished coast are always initialized afresh.
+
+During operation, scheduled or manual target changes retain temperature trends,
+firmware headroom, cutoff/coast estimates, learned overshoot correction, duty
+samples and phase timers. Heating demand is reevaluated immediately against the
+new target, using fresh room and device feedback. Headroom remains bounded by
+the new target plus 3 °C and the device maximum, including large schedule jumps.
+The old target's drift averaging window and unfinished overshoot peak are
+discarded so they cannot teach an incorrect correction for the new target.
+OFF/AUTO target changes do not start software heating.
 Duty cycle remains a diagnostic; heating decisions continue to use live feedback.
 
 During Home Assistant startup, initialization reads the convector's actual
