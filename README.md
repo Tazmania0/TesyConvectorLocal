@@ -24,11 +24,11 @@ correction is bounded and decays on cycles without overshoot. Minimum ON/OFF
 durations protect normal switching, while sensor failure transfers control
 immediately to the device thermostat.
 
-Missing, invalid, out-of-range, or more than 180-second-old sensor reports trigger
+Missing, invalid, out-of-range, or more than 450-second-old sensor reports trigger
 firmware fallback. Freshness uses Home Assistant's `last_reported` timestamp,
 or `last_updated` on older versions. The firmware receives the floored user
 target (22.5 °C becomes 22 °C), including after restart. Recovery starts with
-fresh controller history. Sensors must report at least every three minutes,
+fresh controller history. Sensors must report at least every 7.5 minutes,
 even when their temperature has not changed.
 
 The learned overshoot correction and last five completed duty-cycle samples are

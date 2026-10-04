@@ -555,6 +555,13 @@ def test_stale_numeric_sensor_fallback(entity):
     assert entity._external_temp_reason == 'stale'
 
 
+@pytest.mark.parametrize('age,valid', [(400, True), (449, True), (451, False)])
+def test_external_sensor_extended_timeout_boundary(entity, age, valid):
+    poll(entity, 21.6, age=age)
+    assert entity._external_temp_valid is valid
+    assert entity._sw_fallback_active is (not valid)
+
+
 def test_fresh_unchanged_report_and_legacy_timestamp(entity):
     entity.sensor = sensor(21.6, age=1000)
     entity.sensor.last_reported = datetime.now(timezone.utc)
