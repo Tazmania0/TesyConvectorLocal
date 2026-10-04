@@ -575,6 +575,177 @@ def test_fresh_unchanged_report_and_legacy_timestamp(entity):
     assert entity._sw_fallback_active
 
 
+def attach_decoded_sensor(entity):
+    """Model BTHome's processor contract including cached SensorValue reuse."""
+    # Hashable keys with the fields HA uses.
+    from collections import namedtuple
+    key = namedtuple('EntityKey', 'key device_id')('temperature', None)
+    observers = []
+
+    class Data:
+        def __init__(self, entity_data=None):
+            self.entity_data = entity_data or {}
+
+    class Processor:
+        def __init__(self, convert=None):
+            self.convert = convert
+            self.data = Data()
+            self.listeners = []
+
+        def async_add_listener(self, listener):
+            self.listeners.append(listener)
+            return lambda: self.listeners.remove(listener)
+
+    def register(observer):
+        observers.append(observer)
+        return lambda: observers.remove(observer)
+
+    processor = Processor()
+    processor.coordinator = types.SimpleNamespace(async_register_processor=register)
+    source_type = type('BTHomeSensor', (), {'__module__': 'homeassistant.components.bthome.sensor'})
+    source = source_type()
+    source.processor = processor
+    source.entity_key = key
+    sources = {'sensor.room': source}
+    entity.hass.data = {'sensor': types.SimpleNamespace(get_entity=lambda name: sources.get(name))}
+
+    def emit(value=None, sample=None, field=key):
+        if sample is None:
+            sample = types.SimpleNamespace(native_value=value)
+        update = types.SimpleNamespace(entity_values={field: sample})
+        for observer in list(observers):
+            data = observer.convert(update)
+            for listener in list(observer.listeners):
+                listener(data)
+        return sample
+
+    return emit, observers, sources, key
+
+
+def test_unchanged_decoded_receipts_preserve_active_cycle(entity):
+    emit, observers, _, _ = attach_decoded_sensor(entity)
+    poll(entity, 21.6)
+    assert len(observers) == 1
+    emit(21.6)  # baseline: may be a cached sample, don't claim freshness
+    entity.clock += 300
+    emit(21.6)  # a newly decoded unchanged temperature
+    history = list(entity._sw_temp_history)
+    poll(entity, 21.6, age=600)
+    assert not entity._sw_fallback_active
+    assert entity._external_temp_age_sec == 10
+    assert entity._sw_temp_history[:len(history)] == history
+    assert entity.extra_state_attributes['external_temp_freshness_source'] == 'decoded_temperature_report'
+
+
+def test_cached_or_unrelated_decoded_fields_do_not_refresh(entity):
+    emit, _, _, key = attach_decoded_sensor(entity)
+    poll(entity, 21.6)
+    emit(21.6)
+    sample = emit(21.6)
+    entity.clock += 451
+    emit(sample=sample)  # old SensorValue carried by RSSI-only update
+    emit(71, field=type(key)('battery', None))
+    poll(entity, 21.6, age=600)
+    assert entity._sw_fallback_active
+    assert entity._external_temp_reason == 'stale'
+
+
+@pytest.mark.parametrize('value', [None, True, float('nan'), float('inf'), 81, -41])
+def test_invalid_decoded_receipt_does_not_refresh(entity, value):
+    emit, _, _, _ = attach_decoded_sensor(entity)
+    poll(entity, 21.6)
+    emit(21.6)
+    emit(value)
+    poll(entity, 21.6, age=600)
+    assert entity._sw_fallback_active
+
+
+def test_receipt_listener_rebind_and_cleanup(entity):
+    emit, observers, sources, _ = attach_decoded_sensor(entity)
+    poll(entity, 21.6)
+    emit(21.6)
+    emit(21.6)
+    # Sensor replacement/reload must drop old receipt time and old subscription.
+    old = sources['sensor.room']
+    sources['sensor.room'] = type(old)()
+    sources['sensor.room'].processor = old.processor
+    sources['sensor.room'].entity_key = old.entity_key
+    poll(entity, 21.6, age=600)
+    assert len(observers) == 1
+    assert entity._sw_fallback_active
+    asyncio.run(entity.async_will_remove_from_hass())
+    assert observers == []
+
+
+@pytest.mark.parametrize('timestamp,valid', [
+    (datetime.now(timezone.utc).isoformat(), True),
+    ((datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat(), False),
+    ((datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(), False),
+    ('unavailable', False), ('unknown', False), ('not-a-date', False),
+    ('2026-10-04T10:00:00', False),
+])
+def test_generic_temperature_receipt_timestamp(entity, timestamp, valid):
+    entity._config_entry.options[const.CONF_TEMPERATURE_REPORT_ENTITY] = 'sensor.last_temperature_report'
+    entity.hass.states.get = lambda name: (
+        types.SimpleNamespace(state=timestamp) if name == 'sensor.last_temperature_report' else entity.sensor
+    )
+    poll(entity, 21.6, age=600)
+    assert entity._external_temp_valid is valid
+
+
+def test_fresh_receipt_does_not_rescue_unavailable_temperature(entity):
+    entity._config_entry.options[const.CONF_TEMPERATURE_REPORT_ENTITY] = 'sensor.last_temperature_report'
+    entity.hass.states.get = lambda name: (
+        types.SimpleNamespace(state=datetime.now(timezone.utc).isoformat())
+        if name == 'sensor.last_temperature_report' else entity.sensor
+    )
+    poll(entity, 'unavailable')
+    assert entity._sw_fallback_active
+
+
+def test_decoded_receipt_for_other_temperature_channel_is_ignored(entity):
+    emit, _, _, key = attach_decoded_sensor(entity)
+    poll(entity, 21.6)
+    emit(21.6)
+    emit(21.6, field=type(key)('temperature', 'other_probe'))
+    poll(entity, 21.6, age=600)
+    assert entity._sw_fallback_active
+
+
+def test_optional_adapter_missing_keeps_generic_sensor_working(entity):
+    _, observers, sources, _ = attach_decoded_sensor(entity)
+    sources.clear()
+    poll(entity, 21.6)
+    assert entity._external_temp_valid
+    assert observers == []
+    poll(entity, 21.6, age=600)
+    assert entity._sw_fallback_active
+
+
+def test_receipt_adapter_uses_current_ha_entity_component_registry(entity):
+    emit, observers, _, _ = attach_decoded_sensor(entity)
+    component = entity.hass.data.pop('sensor')
+    entity.hass.data['entity_components'] = {'sensor': component}
+    entity.hass.data['sensor'] = object()  # modern sensor-domain runtime data
+    poll(entity, 21.6)
+    assert len(observers) == 1
+    emit(21.6)
+    emit(21.6)
+    poll(entity, 21.6, age=600)
+    assert entity._external_temp_valid
+
+
+def test_unchanged_decoded_receipt_does_not_add_heater_commands(entity):
+    emit, _, _, _ = attach_decoded_sensor(entity)
+    poll(entity, 21.6)
+    emit(21.6)
+    before = list(entity.convector.calls)
+    for _ in range(4):
+        emit(21.6)
+        poll(entity, 21.6, dt=10, age=600)
+    assert entity.convector.calls == before
+
+
 def test_recovery_seeds_ema_and_clean_histories(entity):
     entity._config_entry.options[const.CONF_SW_EMA_ALPHA] = 0.2
     poll(entity, 21.6)

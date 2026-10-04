@@ -35,6 +35,7 @@ from .const import (
     CONF_TEMP_RECOVERY_RATE,
     CONF_TEMPERATURE_CORRECTION,
     CONF_TEMPERATURE_ENTITY,
+    CONF_TEMPERATURE_REPORT_ENTITY,
     CONF_USE_EXTERNAL_TEMP,
     CONF_WINDOW_OPEN_ENABLED,
     DEFAULT_SW_HYSTERESIS,
@@ -53,6 +54,7 @@ from .const import (
     WINDOW_RECOVERY_HYSTERESIS_SEC,
 )
 from .tesy_convector import TesyConvector
+from .sensor_freshness import SensorFreshness
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -108,6 +110,7 @@ class TesyConvectorClimate(ClimateEntity):
     # Controller learning is persisted separately through Store.
     _unrecorded_attributes = frozenset({
         "sw_control_state", "external_temp_valid", "external_temp_age_sec",
+        "external_temp_freshness_source", "external_temp_reason",
         "filtered_external_temp", "raw_external_temp", "internal_temp",
         "external_temperature_error", "sw_heat_requested", "firmware_limit_estimated",
         "firmware_fallback_active", "overshoot_correction", "i_correction",
@@ -177,6 +180,7 @@ class TesyConvectorClimate(ClimateEntity):
         self._sw_firmware_limit_estimated: bool | None = None
         self._external_temp_reason = "missing sensor"
         self._external_sensor_entity: str | None = None
+        self._sensor_freshness = None
         self._sw_fallback_active = False
         self._sw_was_enabled = False
         self._sw_ramp_rate: float | None = None
@@ -390,6 +394,8 @@ class TesyConvectorClimate(ClimateEntity):
         )
 
     async def async_will_remove_from_hass(self):
+        if self._sensor_freshness is not None:
+            self._sensor_freshness.close()
         if self._remove_update_listener:
             self._remove_update_listener()
             self._remove_update_listener = None
@@ -1206,6 +1212,9 @@ class TesyConvectorClimate(ClimateEntity):
         self._external_temp_age_sec = None
         self._external_temp_reason = "missing"
         state = self.hass.states.get(temperature_entity) if temperature_entity else None
+        if self._sensor_freshness is None:
+            self._sensor_freshness = SensorFreshness(self.hass)
+        self._sensor_freshness.bind(temperature_entity)
         raw = None
         if state is not None:
             # last_reported includes unchanged numeric reports on modern HA.
@@ -1217,6 +1226,9 @@ class TesyConvectorClimate(ClimateEntity):
             except (TypeError, ValueError):
                 self._external_temp_reason = "unavailable or invalid"
             else:
+                self._external_temp_age_sec = self._sensor_freshness.age(
+                    state, raw, self._get_options().get(CONF_TEMPERATURE_REPORT_ENTITY)
+                )
                 if not math.isfinite(raw) or not -40.0 <= raw <= 80.0:
                     self._external_temp_reason = "out of range"
                     raw = None
@@ -1227,6 +1239,7 @@ class TesyConvectorClimate(ClimateEntity):
             self._ema_temp = None
             return None
         self._external_temp_valid = True
+        self._external_temp_reason = "valid"
         self._external_raw_temp = raw
         alpha = max(0.0, min(1.0, ema_alpha))
         self._ema_temp = raw if self._ema_temp is None else alpha * raw + (1.0 - alpha) * self._ema_temp
@@ -1475,6 +1488,8 @@ class TesyConvectorClimate(ClimateEntity):
         attrs.update({
             "sw_control_state": state,
             "external_temp_valid": self._external_temp_valid,
+            "external_temp_reason": self._external_temp_reason,
+            "external_temp_freshness_source": self._sensor_freshness.source if self._sensor_freshness else "entity_report",
             "external_temp_age_sec": round(self._external_temp_age_sec, 1) if self._external_temp_age_sec is not None else None,
             "filtered_external_temp": self._ema_temp,
             "raw_external_temp": self._external_raw_temp,

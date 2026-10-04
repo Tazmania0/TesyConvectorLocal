@@ -43,7 +43,8 @@
           "sw_i_gain": "Drift correction strength (0 = off, 0.5 = recommended, 1.0 = full)",
           "sw_ema_alpha": "Sensor noise filtering (0.1 = smooth, 0.3 = recommended, 1.0 = off)",
           "cloud_telemetry_enabled": "Use MyTESY cloud heating telemetry",
-          "cloud_telemetry_reconfigure": "Choose or reconnect cloud device"
+          "cloud_telemetry_reconfigure": "Choose or reconnect cloud device",
+          "temperature_report_entity": "Last temperature report timestamp (optional)"
         },
         "data_description": {
           "temperature_correction": "Integer offset −4…+4 applied by the device firmware in all control modes.",
@@ -61,7 +62,8 @@
           "sw_i_gain": "Corrects long-term average temperature drift above the setpoint. 0 = disabled. 0.5 = recommended starting point (halves the measured drift). 1.0 = full correction. Increase if the room consistently runs above setpoint over 30+ minutes.",
           "sw_ema_alpha": "Low-pass filter applied to the external sensor to remove noise. 0.1 = heavy smoothing (slow to respond, very stable). 0.3 = recommended (30s time constant at 10s poll). 1.0 = no filtering (raw sensor). Reduce if the sensor is noisy.",
           "cloud_telemetry_enabled": "Optional read-only cloud reports for heating activity and device temperature. Local temperature control continues independently.",
-          "cloud_telemetry_reconfigure": "Sign in again and select the matching heater. Required when changing cloud credentials or the selected device."
+          "cloud_telemetry_reconfigure": "Sign in again and select the matching heater. Required when changing cloud credentials or the selected device.",
+          "temperature_report_entity": "Select a timestamp sensor updated for every received temperature report, including unchanged readings. Leave empty for automatic freshness. Do not use a general device last-seen or connectivity sensor."
         }
       },
       "cloud_login": {

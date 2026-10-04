@@ -49,6 +49,7 @@ from .const import (
     CONF_TEMP_RECOVERY_RATE,
     CONF_TEMPERATURE_CORRECTION,
     CONF_TEMPERATURE_ENTITY,
+    CONF_TEMPERATURE_REPORT_ENTITY,
     CONF_USE_EXTERNAL_TEMP,
     CONF_WINDOW_OPEN_ENABLED,
     DEFAULT_SW_HYSTERESIS,
@@ -98,6 +99,7 @@ def _build_options_schema(
     sw_i_gain: float,
     sw_ema_alpha: float,
     cloud_telemetry_enabled: bool = False,
+    temperature_report_entity: str | None = None,
 ) -> vol.Schema:
     """Build options schema.
 
@@ -119,6 +121,13 @@ def _build_options_schema(
         schema_dict[
             vol.Required(CONF_TEMPERATURE_ENTITY, default=temp_entity)
         ] = EntitySelector(EntitySelectorConfig(domain="sensor"))
+        report_field = (
+            vol.Optional(CONF_TEMPERATURE_REPORT_ENTITY, default=temperature_report_entity)
+            if temperature_report_entity else vol.Optional(CONF_TEMPERATURE_REPORT_ENTITY)
+        )
+        schema_dict[report_field] = EntitySelector(
+            EntitySelectorConfig(domain="sensor", device_class="timestamp")
+        )
 
         # --- Window detection ---
         schema_dict[
@@ -283,6 +292,7 @@ class TesyConvectorOptionsFlowHandler(config_entries.OptionsFlow):
                 if not use_external_new:
                     for key in [
                         CONF_TEMPERATURE_ENTITY,
+                        CONF_TEMPERATURE_REPORT_ENTITY,
                         CONF_WINDOW_OPEN_ENABLED,
                         CONF_TEMP_FALL_RATE,
                         CONF_TEMP_RECOVERY_RATE,
@@ -325,6 +335,7 @@ class TesyConvectorOptionsFlowHandler(config_entries.OptionsFlow):
                 correction=int(user_input.get(CONF_TEMPERATURE_CORRECTION, current_correction)),
                 use_external=use_external_new,
                 temp_entity=user_input.get(CONF_TEMPERATURE_ENTITY, current_temp_entity),
+                temperature_report_entity=user_input.get(CONF_TEMPERATURE_REPORT_ENTITY),
                 window_open_enabled=window_open_enabled_new,
                 fall_rate=user_input.get(CONF_TEMP_FALL_RATE, current_fall_rate),
                 recovery_rate=user_input.get(CONF_TEMP_RECOVERY_RATE, current_recovery_rate),
@@ -345,6 +356,7 @@ class TesyConvectorOptionsFlowHandler(config_entries.OptionsFlow):
             correction=current_correction,
             use_external=use_external,
             temp_entity=current_temp_entity,
+            temperature_report_entity=options.get(CONF_TEMPERATURE_REPORT_ENTITY),
             window_open_enabled=window_open_enabled,
             fall_rate=current_fall_rate,
             recovery_rate=current_recovery_rate,

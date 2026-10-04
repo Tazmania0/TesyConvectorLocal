@@ -29,7 +29,26 @@ firmware fallback. Freshness uses Home Assistant's `last_reported` timestamp,
 or `last_updated` on older versions. The firmware receives the floored user
 target (22.5 °C becomes 22 °C), including after restart. Recovery starts with
 fresh controller history. Sensors must report at least every 7.5 minutes,
-even when their temperature has not changed.
+even when their temperature has not changed. For BTHome sensors, the integration
+also observes newly decoded temperature samples, including unchanged values
+that Home Assistant suppresses at the entity level. Cached temperature fields,
+RSSI-only reports, and other measurements do not refresh temperature freshness.
+The adapter attaches automatically after the sensor loads, reattaches after
+sensor replacement, and uses HA's existing decoder without additional scanning
+or encryption credentials. It waits for a new sample after establishing its
+initial baseline; restored/cached data does not count as a new receipt.
+
+Other integrations continue to use `last_reported` / `last_updated`. If they
+suppress unchanged values, an optional **Last temperature report timestamp**
+sensor can be selected in the options. It must provide a timezone-aware timestamp
+of the latest received temperature measurement, including unchanged readings.
+Do not select a generic device last-seen, battery, RSSI, or connectivity heartbeat.
+Invalid/unavailable temperature values still cause fallback even with a recent
+timestamp. Future, malformed, unavailable, or old timestamps cannot extend
+freshness. Temperature control still evaluates every 10 seconds; the 450-second
+limit is an outage allowance, not a response delay. Climate diagnostic attributes
+`external_temp_freshness_source` and `external_temp_reason` show which receipt
+source is used and why a reading was rejected, and are excluded from recording.
 
 The learned overshoot correction and last five completed duty-cycle samples are
 saved in Home Assistant storage after each completed heating cycle. They survive
