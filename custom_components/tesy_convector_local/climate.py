@@ -1186,10 +1186,14 @@ class TesyConvectorClimate(ClimateEntity):
         ):
             self._sw_blocked_since = None
             return min(3, self._sw_headroom + 1)
-        blocked = eligible and cloud.heating is False and (
-            cloud.temperature is None
-            or cloud.temperature - CLOUD_TEMPERATURE_STEP / 2 >= self._sw_applied_setpoint - 0.5
-        ) and self._sw_cloud_internal_coast is None
+        # A thermostat may stay OFF below its setpoint because of hysteresis
+        # or an unreported internal sensor. Rounded cloud temperature cannot
+        # disprove a sustained OFF report while the room still needs heat.
+        # Allow a coast to settle, but do not wait indefinitely for a visible
+        # 0.5 C fall that a quantized sensor may never report.
+        coast = self._sw_cloud_internal_coast
+        coast_settled = coast is None or now - coast[0] >= 120
+        blocked = eligible and cloud.heating is False and coast_settled
         if not blocked:
             self._sw_blocked_since = None
             return self._sw_headroom

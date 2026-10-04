@@ -258,6 +258,45 @@ def test_old_report_cannot_raise_ceiling(entity):
     assert entity._sw_headroom == 0
 
 
+def test_sustained_off_below_firmware_setpoint_does_not_stall_room_heating(entity):
+    entity._target_temp = 23
+    cloud_feedback(entity, heating=False, temperature=23.5)
+    run(entity, 22.49)
+    entity._sw_headroom = 1
+    entity._sw_applied_setpoint = 24
+    entity.convector.setpoint = 24
+    run(entity, 22.49, dt=60)
+    assert entity.convector.setpoint == 24
+    run(entity, 22.49, dt=60)
+    assert entity.convector.setpoint == 25
+    assert entity._sw_headroom == 2
+    assert entity._sw_device_on is True
+
+
+def test_unresolved_quantized_coast_has_bounded_wait_before_boost(entity):
+    cloud = cloud_feedback(entity, heating=True, temperature=22)
+    run(entity, 21.0)
+    cloud.heating = False
+    run(entity, 21.0, dt=30)
+    assert entity._sw_cloud_internal_coast is not None
+    run(entity, 21.0, dt=60)
+    assert entity._sw_headroom == 0
+    run(entity, 21.0, dt=60)
+    assert entity._sw_headroom == 0
+    run(entity, 21.0, dt=60)
+    assert entity._sw_headroom == 1
+
+
+def test_brief_actual_off_does_not_raise_headroom(entity):
+    cloud = cloud_feedback(entity, heating=False, temperature=21.0)
+    run(entity, 21.0)
+    run(entity, 21.0, dt=30)
+    cloud.heating = True
+    run(entity, 21.0, dt=30)
+    run(entity, 21.0, dt=60)
+    assert entity._sw_headroom == 0
+
+
 def test_cloud_cutoff_uses_internal_rate_and_learns_firmware_threshold(entity):
     cloud = cloud_feedback(entity, heating=True, temperature=21.0)
     run(entity, 21.0)

@@ -64,6 +64,14 @@ the new target plus 3 °C and the device maximum, including large schedule jumps
 The old target's drift averaging window and unfinished overshoot peak are
 discarded so they cannot teach an incorrect correction for the new target.
 OFF/AUTO target changes do not start software heating.
+
+Fresh cloud OFF reports can justify bounded firmware headroom even when the
+rounded device temperature is below its firmware setpoint. The controller
+requires sustained OFF feedback and room/predicted temperatures below the ON
+threshold. After an actual stop, it gives internal coasting two minutes to
+settle before starting the sustained-OFF wait, so an unresolved 0.5 °C plateau
+cannot block adaptation indefinitely. Existing command spacing and headroom
+limits still apply.
 Duty cycle remains a diagnostic; heating decisions continue to use live feedback.
 
 During Home Assistant startup, initialization reads the convector's actual
