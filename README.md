@@ -104,7 +104,7 @@ fresh cloud telemetry can justify bounded headroom as described below.
 software OFF uses the supported minimum setpoint of 10 °C to preserve the device
 connection without the firmware continuing to heat a normally warm room.
 
-These values are also exposed as enabled-by-default diagnostic entities on the
+These values are also exposed as disabled-by-default diagnostic entities on the
 heater's device page. Sensors include Controller state, Requested duty cycle,
 Room temperature error, Internal temperature, Filtered external temperature,
 Predicted temperature, Effective OFF threshold, and Learned overshoot correction.
@@ -112,7 +112,12 @@ Binary sensors show External temperature valid, Firmware fallback active,
 Software heating requested, and Firmware limiting estimated.
 
 After installing a version with the diagnostic entities, restart Home Assistant
-and open Settings → Devices & services → Tesy → your heater → Diagnostic.
+and open Settings → Devices & services → Tesy → your heater. Enable individual
+diagnostic entities from the device's disabled entities list when needed.
+Existing entities retain their enabled/disabled setting after upgrading; disable
+them manually to stop their updates and new state-history recordings. This does
+not delete existing history. Enabling a diagnostic entity allows Recorder to
+record it unless excluded using the filters below.
 Numeric diagnostics and controller flags are available when software control is
 enabled. Controller state remains visible as `SW_DISABLED` when it is disabled;
 duty cycle is unknown until a complete cycle has been measured or restored.

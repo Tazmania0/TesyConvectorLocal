@@ -322,7 +322,7 @@ def _diagnostic_climate(attributes=None, available=True):
     )
 
 
-def test_diagnostic_sensor_setup_groups_enabled_entities_with_heater():
+def test_diagnostic_sensor_setup_groups_disabled_by_default_entities_with_heater():
     entry = _DummyEntry(options={const.CONF_SW_CONTROL_ENABLED: True})
     climate = _diagnostic_climate({'sw_control_state': 'SW_HEATING', 'duty_cycle_pct': 67})
     hass = types.SimpleNamespace(data={const.DOMAIN: {entry.entry_id: {'climate_entity': climate}}})
@@ -332,7 +332,7 @@ def test_diagnostic_sensor_setup_groups_enabled_entities_with_heater():
     assert len({item._attr_unique_id for item in added}) == len(added)
     for item in added:
         assert item._attr_entity_category == 'diagnostic'
-        assert item._attr_entity_registry_enabled_default is True
+        assert item._attr_entity_registry_enabled_default is False
         assert item._attr_device_info['identifiers'] == {(const.DOMAIN, entry.entry_id)}
         assert item.available is (not item.entity_description.key.startswith('cloud_'))
         assert fnmatchcase(f'sensor.{item.suggested_object_id}', 'sensor.*tesy_diagnostic_*')
@@ -381,7 +381,7 @@ def test_controller_binary_diagnostics_follow_flags_and_unknown_values():
     climate.extra_state_attributes.update({'external_temp_valid': False, 'firmware_fallback_active': True})
     assert entities['external_temp_valid'].is_on is False
     assert entities['firmware_fallback_active'].is_on is True
-    assert all(item._attr_entity_registry_enabled_default for item in entities.values())
+    assert all(not item._attr_entity_registry_enabled_default for item in entities.values())
     assert all(fnmatchcase(f'binary_sensor.{item.suggested_object_id}',
                           'binary_sensor.*tesy_diagnostic_*') for item in entities.values())
     entry.options[const.CONF_SW_CONTROL_ENABLED] = False
